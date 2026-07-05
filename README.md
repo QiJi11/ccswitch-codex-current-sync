@@ -1,89 +1,104 @@
 # ccswitch-codex-current-sync
 
-一个用于修复 **CC Switch 当前 Codex provider 与新 Codex 窗口启动配置不同步** 的小型 workaround。
+这个仓库最初用于修复 `ccswitch-current` home 漂移问题。当前推荐方案已经调整为：
 
-## 问题
+每次启动新的 `codex` 窗口前，读取 CC Switch 当前选中的 Codex provider，把它的 `settings_config.config` 和 `settings_config.auth` 物化到一个新的独立 Codex home，然后让 Prodex 用这个 home 启动。
 
-目标行为：
+这样可以得到两个效果：
 
-- 新开的 `codex` 窗口应读取 CC Switch 当前选中的 Codex provider。
-- 已经打开的旧 Codex 窗口不应被后续 provider 切换热影响。
-- 旧窗口退出后重新输入 `codex`，才应读取最新 provider。
+- 新开的 `codex` 窗口总是使用启动那一刻 CC Switch 当前选中的 Codex provider。
+- 已经打开的旧窗口继续使用自己的 run home，不会被后续 CC Switch 切换热影响。
 
-实际可能出现的问题：
+## 工作方式
 
-- CC Switch 已经切到 provider A。
-- 新启动的 Codex profile home 里 `config.toml` / `auth.json` 仍停留在 provider B。
-- 结果新窗口连到旧 `base_url` 或使用旧 auth。
+`scripts/materialize-ccswitch-codex-run.ps1` 会：
 
-本仓库提供的脚本会在启动 Codex 前，把 CC Switch 当前 Codex provider 的 `settings_config.config` 和 `settings_config.auth` 同步到目标 Codex home。
+- 从 `~\.cc-switch\settings.json` 读取 `currentProviderCodex`。
+- 只读查询 `~\.cc-switch\cc-switch.db` 里的 `providers` / `provider_endpoints`。
+- 从当前 provider 的 `settings_config.config` 和 `settings_config.auth` 写出新的启动快照。
+- 创建新的 home：`~\.prodex\manual-homes\ccswitch-runs\ccswitch-run-*`。
+- 写入 `config.toml`、`auth.json` 和不含密钥的 `run-provider.json`。
+- 在写入新的 Prodex profile 前备份 `~\.prodex\state.json`。
 
 ## 安全边界
 
 - 不修改 CC Switch 数据库。
+- 不修改 CC Switch 当前 provider。
+- 不复用或覆盖旧窗口正在使用的 run home。
 - 不删除历史、session、`state_*.sqlite` 或 `history.jsonl`。
 - 不 kill `codex`、`node`、`pwsh` 等进程。
 - 不输出 API key、token、Authorization、cookie。
-- 仅当目标文件内容实际不同，才备份并重写。
 
-## 使用方法
+## 安装
 
 PowerShell:
 
 ```powershell
-.\scripts\sync-ccswitch-current-codex.ps1 `
-  -CodexHome "$env:USERPROFILE\.prodex\manual-homes\ccswitch-current"
-```
-
-如果你使用默认 Codex home，也可以指定：
-
-```powershell
-.\scripts\sync-ccswitch-current-codex.ps1 `
-  -CodexHome "$env:USERPROFILE\.codex"
-```
-
-仅检查、不写入：
-
-```powershell
-.\scripts\sync-ccswitch-current-codex.ps1 `
-  -CodexHome "$env:USERPROFILE\.prodex\manual-homes\ccswitch-current" `
-  -CheckOnly
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.prodex\bin" | Out-Null
+Copy-Item .\scripts\materialize-ccswitch-codex-run.ps1 `
+  "$env:USERPROFILE\.prodex\bin\materialize-ccswitch-codex-run.ps1" `
+  -Force
 ```
 
 ## 接入启动 wrapper
 
-在你的 `codex` wrapper 调用真正的 Codex / Prodex 前加入：
+在 `codex` wrapper 调用 `prodex run` 前先生成本次启动的 provider 快照：
 
 ```powershell
-& "C:\path\to\ccswitch-codex-current-sync\scripts\sync-ccswitch-current-codex.ps1" `
-  -CodexHome "$env:USERPROFILE\.prodex\manual-homes\ccswitch-current" `
-  -Quiet
+function codex {
+  $snapshot = (& "$env:USERPROFILE\.prodex\bin\materialize-ccswitch-codex-run.ps1" -Quiet |
+    Select-Object -Last 1 |
+    ConvertFrom-Json)
+
+  & "$env:APPDATA\npm\prodex.ps1" run `
+    --profile ([string]$snapshot.profileName) `
+    --no-auto-rotate `
+    --full-access `
+    @args
+}
 ```
 
-然后再启动：
-
-```powershell
-prodex run --profile ccswitch-current --no-auto-rotate --full-access
-```
+如果你的 wrapper 里还有 `PRODEX_CODEX_BIN` 固定、默认 `--cd`、focus reporting 等逻辑，可以保留；关键点是 `prodex run --profile` 使用 `$snapshot.profileName`，而不是固定的 `ccswitch-current`。
 
 ## 验证
 
 ```powershell
-prodex run --profile ccswitch-current --no-auto-rotate --dry-run
-Select-String -LiteralPath "$env:USERPROFILE\.prodex\manual-homes\ccswitch-current\config.toml" -Pattern 'base_url'
+. "$PROFILE"
+codex --dry-run
 ```
 
 预期：
 
-- `CODEX_HOME` 指向你的目标 home。
-- `config.toml` 的 `base_url` 与 CC Switch 当前 Codex provider 的 `settings_config.config` 一致。
-- 第二次运行脚本时显示 `config.toml unchanged` / `auth.json unchanged`，不会重复生成备份。
+- dry-run 退出码为 0。
+- 输出里的 `CODEX_HOME` 指向 `~\.prodex\manual-homes\ccswitch-runs\ccswitch-run-*`。
+- 对应 home 里的 `config.toml` 的 `base_url` 与 CC Switch 当前 Codex provider 的 `settings_config.config` 一致。
 
-## English summary
+可以检查本次 run home：
 
-This repository contains a small PowerShell workaround for syncing the currently selected CC Switch Codex provider into a target Codex home before launching a new Codex window. It copies only `settings_config.config` and `settings_config.auth` from the current Codex provider, backs up changed files, does not touch CC Switch DB state, and does not affect already running Codex windows.
+```powershell
+$runHome = "$env:USERPROFILE\.prodex\manual-homes\ccswitch-runs\<ccswitch-run-name>"
+Select-String -LiteralPath "$runHome\config.toml" -Pattern '^\s*base_url\s*='
+Get-Content -Raw -LiteralPath "$runHome\run-provider.json" |
+  ConvertFrom-Json |
+  Select-Object providerName, providerId, baseUrl, configSha256, authSha256
+```
+
+## 为什么旧窗口不会被热切换影响
+
+每次启动都会创建一个新的 run home，并把启动时的 provider 配置写入这个 home。启动后的 Codex 进程拿到的是自己的 `CODEX_HOME` 环境变量，指向这个独立目录。
+
+后续 CC Switch 切换只会影响下一次 materialize 的输入，不会重写已经存在的 run home，所以旧窗口继续使用它启动时的 provider 快照。
+
+## Legacy: 同步 ccswitch-current
+
+`scripts/sync-ccswitch-current-codex.ps1` 仍保留，用于手动把当前 CC Switch Codex provider 同步到一个指定 Codex home，例如 `ccswitch-current`。
+
+这个旧脚本适合修正 home 漂移，但它复用同一个目标 home，不是“不同窗口保持不同 provider”的推荐方案。
 
 ## 上游状态
 
-- 相关 issue：<https://github.com/farion1231/cc-switch/issues/4944>
-- Draft PR：<https://github.com/farion1231/cc-switch/pull/5013>
+此前错误方向的 PR `farion1231/cc-switch#5013` 已关闭。当前问题本质是启动 wrapper 的“每窗口 provider 快照隔离”，不是修改 CC Switch provider 切换时的全局 auth 同步逻辑。
+
+## English summary
+
+The recommended workaround is to materialize the currently selected CC Switch Codex provider into a new per-launch Codex home before calling `prodex run`. Each Codex window receives its own `CODEX_HOME`, so later provider switches only affect future launches and do not rewrite homes used by already running windows.
