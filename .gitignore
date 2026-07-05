@@ -1,0 +1,19 @@
+# Local cc-switch/Codex state. Do not commit live credentials or history.
+*.db
+*.sqlite
+*.sqlite3
+auth.json
+config.toml
+history.jsonl
+state_*.sqlite
+*.bak-*
+
+# Logs and temporary files.
+*.log
+*.tmp
+.tmp/
+tmp/
+
+# Editor/OS noise.
+.DS_Store
+Thumbs.db
