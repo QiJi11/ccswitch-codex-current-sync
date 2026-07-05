@@ -82,3 +82,8 @@ Select-String -LiteralPath "$env:USERPROFILE\.prodex\manual-homes\ccswitch-curre
 ## English summary
 
 This repository contains a small PowerShell workaround for syncing the currently selected CC Switch Codex provider into a target Codex home before launching a new Codex window. It copies only `settings_config.config` and `settings_config.auth` from the current Codex provider, backs up changed files, does not touch CC Switch DB state, and does not affect already running Codex windows.
+
+## 上游状态
+
+- 相关 issue：<https://github.com/farion1231/cc-switch/issues/4944>
+- Draft PR：<https://github.com/farion1231/cc-switch/pull/5013>
