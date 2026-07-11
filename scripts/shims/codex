@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -u
+
+launcher="${USERPROFILE}\\.prodex\\bin\\invoke-ccswitch-codex.ps1"
+if command -v pwsh.exe >/dev/null 2>&1; then
+  powershell_bin="pwsh.exe"
+elif command -v powershell.exe >/dev/null 2>&1; then
+  powershell_bin="powershell.exe"
+else
+  printf 'PowerShell is required to launch Codex.\n' >&2
+  exit 1
+fi
+
+"${powershell_bin}" -NoProfile -ExecutionPolicy Bypass -File "${launcher}" "$@"

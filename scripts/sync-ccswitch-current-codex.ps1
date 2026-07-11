@@ -1,27 +1,32 @@
 [CmdletBinding()]
 param(
     [string]$CcSwitchRoot = (Join-Path $env:USERPROFILE '.cc-switch'),
-    [string]$CodexHome = '',
+    [string[]]$CodexHome = @(),
     [switch]$CheckOnly,
     [switch]$Quiet
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
-if ([string]::IsNullOrWhiteSpace($CodexHome)) {
-    $prodexCurrent = Join-Path $env:USERPROFILE '.prodex\manual-homes\ccswitch-current'
+$prodexRoot = if ([string]::IsNullOrWhiteSpace($env:PRODEX_HOME)) {
+    Join-Path $env:USERPROFILE '.prodex'
+} else {
+    [System.IO.Path]::GetFullPath($env:PRODEX_HOME)
+}
+$CodexHomes = @($CodexHome | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+if ($CodexHomes.Count -eq 0) {
+    $prodexCurrent = Join-Path $prodexRoot 'manual-homes\ccswitch-current'
     if (Test-Path -LiteralPath $prodexCurrent) {
-        $CodexHome = $prodexCurrent
+        $CodexHomes = @($prodexCurrent)
     } else {
-        $CodexHome = Join-Path $env:USERPROFILE '.codex'
+        $CodexHomes = @(Join-Path $env:USERPROFILE '.codex')
     }
 }
 
 $SettingsPath = Join-Path $CcSwitchRoot 'settings.json'
 $DbPath = Join-Path $CcSwitchRoot 'cc-switch.db'
-$ConfigPath = Join-Path $CodexHome 'config.toml'
-$AuthPath = Join-Path $CodexHome 'auth.json'
 
 function Write-SyncInfo {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -38,6 +43,50 @@ function Get-TextFileContent {
     } finally {
         $reader.Dispose()
     }
+}
+
+function Get-CurrentProviderId {
+    $settings = Get-TextFileContent -Path $SettingsPath | ConvertFrom-Json
+    if (-not $settings.PSObject.Properties['currentProviderCodex']) {
+        throw 'cc-switch settings do not define currentProviderCodex.'
+    }
+    $providerId = [string]$settings.currentProviderCodex
+    if ([string]::IsNullOrWhiteSpace($providerId)) {
+        throw 'cc-switch currentProviderCodex is empty.'
+    }
+    return $providerId
+}
+
+function Get-DatabaseCurrentProviderId {
+    $pythonCode = @'
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+uri = Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
+connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+try:
+    connection.execute("pragma query_only=on")
+    connection.execute("begin")
+    rows = connection.execute(
+        "select id from providers where app_type='codex' and is_current=1 order by id"
+    ).fetchall()
+    print(json.dumps({"ids": [row[0] for row in rows]}, ensure_ascii=True))
+finally:
+    connection.close()
+'@
+    $global:LASTEXITCODE = 0
+    $output = @(& $pythonCommand.Source -c $pythonCode $DbPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "cc-switch current-provider verification failed with exit code $LASTEXITCODE."
+    }
+    $result = (($output | Out-String).Trim()) | ConvertFrom-Json
+    $ids = @($result.ids)
+    if ($ids.Count -ne 1) {
+        throw "Expected exactly one current Codex provider during mirror verification; found $($ids.Count)."
+    }
+    return [string]$ids[0]
 }
 
 function Write-Utf8NoBom {
@@ -109,15 +158,7 @@ if (-not (Test-Path -LiteralPath $DbPath)) {
     throw "Missing cc-switch DB: $DbPath"
 }
 
-$settings = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
-if (-not $settings.PSObject.Properties['currentProviderCodex']) {
-    throw 'cc-switch settings do not define currentProviderCodex.'
-}
-
-$currentProviderId = [string]$settings.currentProviderCodex
-if ([string]::IsNullOrWhiteSpace($currentProviderId)) {
-    throw 'cc-switch currentProviderCodex is empty.'
-}
+$currentProviderId = Get-CurrentProviderId
 
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if ($null -eq $pythonCommand) {
@@ -173,17 +214,24 @@ def public_provider(row):
 def fail(message, **extra):
     result = {"ok": False, "message": message}
     result.update(extra)
-    print(json.dumps(result, ensure_ascii=False))
+    write_result(result)
     raise SystemExit(0)
 
 
 db_path = sys.argv[1]
 provider_id = sys.argv[2]
+output_path = sys.argv[3]
 db_uri = "file:" + Path(db_path).as_posix() + "?mode=ro"
 
-con = sqlite3.connect(db_uri, uri=True)
+con = sqlite3.connect(db_uri, uri=True, isolation_level=None)
 con.row_factory = sqlite3.Row
+con.execute("pragma query_only=on")
+con.execute("begin")
 cur = con.cursor()
+
+
+def write_result(result):
+    Path(output_path).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
 
 active_rows = cur.execute(
     "select id, name, settings_config from providers where app_type='codex' and is_current=1 order by name"
@@ -229,22 +277,42 @@ result = {
     "configSha256": sha_text(config_text),
     "authSha256": sha_text(auth),
 }
-print(json.dumps(result, ensure_ascii=False))
+write_result(result)
 con.close()
 '@
 
 $tempPythonPath = Join-Path ([System.IO.Path]::GetTempPath()) "sync-ccswitch-current-codex-$PID-$([guid]::NewGuid().ToString('N')).py"
+$tempQueryOutputPath = Join-Path ([System.IO.Path]::GetTempPath()) "sync-ccswitch-current-codex-$PID-$([guid]::NewGuid().ToString('N')).json"
+$previousPythonIoEncoding = $env:PYTHONIOENCODING
+$previousPythonUtf8 = $env:PYTHONUTF8
 try {
     [System.IO.File]::WriteAllText($tempPythonPath, $pythonCode, [System.Text.UTF8Encoding]::new($false))
-    $queryOutput = & $pythonCommand.Source $tempPythonPath $DbPath $currentProviderId
+    $env:PYTHONIOENCODING = 'utf-8'
+    $env:PYTHONUTF8 = '1'
+    & $pythonCommand.Source $tempPythonPath $DbPath $currentProviderId $tempQueryOutputPath
     if ($LASTEXITCODE -ne 0) {
         throw "cc-switch provider query failed with exit code $LASTEXITCODE."
     }
+    if (-not (Test-Path -LiteralPath $tempQueryOutputPath)) {
+        throw 'cc-switch provider query did not write its output.'
+    }
+    $queryJson = Get-TextFileContent -Path $tempQueryOutputPath
 } finally {
+    if ($null -eq $previousPythonIoEncoding) {
+        Remove-Item Env:\PYTHONIOENCODING -ErrorAction SilentlyContinue
+    } else {
+        $env:PYTHONIOENCODING = $previousPythonIoEncoding
+    }
+    if ($null -eq $previousPythonUtf8) {
+        Remove-Item Env:\PYTHONUTF8 -ErrorAction SilentlyContinue
+    } else {
+        $env:PYTHONUTF8 = $previousPythonUtf8
+    }
     Remove-Item -LiteralPath $tempPythonPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempQueryOutputPath -Force -ErrorAction SilentlyContinue
 }
 
-$queryJson = ($queryOutput | Out-String).Trim()
+$queryJson = $queryJson.Trim()
 if ([string]::IsNullOrWhiteSpace($queryJson)) {
     throw 'cc-switch provider query returned no data.'
 }
@@ -261,27 +329,46 @@ if (-not [bool]$details.ok) {
     throw $message
 }
 
-if (-not $CheckOnly) {
-    New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
+$currentProviderAfter = Get-CurrentProviderId
+if (-not [string]::Equals($currentProviderId, $currentProviderAfter, [StringComparison]::Ordinal)) {
+    throw 'cc-switch provider selection changed while capturing the mirror snapshot.'
 }
+
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-
-$configResult = Sync-TextFile -Path $ConfigPath -DesiredContent ([string]$details.config) -Stamp $stamp
-$authResult = Sync-TextFile -Path $AuthPath -DesiredContent ([string]$details.authJson) -Stamp $stamp
-
-Write-SyncInfo ("ccswitch-current provider={0} id={1} base_url={2} config_sha256={3} auth_sha256={4}" -f `
-    $details.provider.name, $details.provider.id, $details.provider.baseUrl, $details.configSha256, $details.authSha256)
-
-foreach ($result in @($configResult, $authResult)) {
-    $leaf = Split-Path -Leaf $result.Path
-    if ($result.Changed) {
-        $action = if ($CheckOnly) { 'would update' } else { 'updated' }
-        if ($null -eq $result.BackupPath) {
-            Write-SyncInfo ("{0} {1} backup=<none-existing-file>" -f $leaf, $action)
-        } else {
-            Write-SyncInfo ("{0} {1} backup={2}" -f $leaf, $action, $result.BackupPath)
-        }
-    } else {
-        Write-SyncInfo ("{0} unchanged" -f $leaf)
+foreach ($targetHome in $CodexHomes) {
+    if (-not $CheckOnly) {
+        New-Item -ItemType Directory -Path $targetHome -Force | Out-Null
     }
+    $configResult = Sync-TextFile `
+        -Path (Join-Path $targetHome 'config.toml') `
+        -DesiredContent ([string]$details.config) `
+        -Stamp $stamp
+    $authResult = Sync-TextFile `
+        -Path (Join-Path $targetHome 'auth.json') `
+        -DesiredContent ([string]$details.authJson) `
+        -Stamp $stamp
+
+    Write-SyncInfo ("ccswitch-current home={0} provider={1} id={2} config_sha256={3} auth_sha256={4}" -f `
+        $targetHome, $details.provider.name, $details.provider.id, $details.configSha256, $details.authSha256)
+
+    foreach ($result in @($configResult, $authResult)) {
+        $leaf = Split-Path -Leaf $result.Path
+        if ($result.Changed) {
+            $action = if ($CheckOnly) { 'would update' } else { 'updated' }
+            if ($null -eq $result.BackupPath) {
+                Write-SyncInfo ("{0} {1} backup=<none-existing-file>" -f $leaf, $action)
+            } else {
+                Write-SyncInfo ("{0} {1} backup={2}" -f $leaf, $action, $result.BackupPath)
+            }
+        } else {
+            Write-SyncInfo ("{0} unchanged" -f $leaf)
+        }
+    }
+}
+
+$currentProviderFinal = Get-CurrentProviderId
+$databaseProviderFinal = Get-DatabaseCurrentProviderId
+if ((-not [string]::Equals([string]$details.provider.id, $currentProviderFinal, [StringComparison]::Ordinal)) -or
+    (-not [string]::Equals([string]$details.provider.id, $databaseProviderFinal, [StringComparison]::Ordinal))) {
+    throw 'cc-switch provider selection changed while updating the current-provider mirrors.'
 }
