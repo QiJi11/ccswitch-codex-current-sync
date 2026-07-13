@@ -4,7 +4,7 @@
 
 ## 目标行为
 
-- 在 CC Switch UI 选择 provider A 后执行 `codex`，新进程获得 A 的独立 `CODEX_HOME` 快照和私有 Prodex runtime。
+- 在 CC Switch UI 选择 provider A 后执行 `codex`，新进程获得 A 的独立 `CODEX_HOME` 快照，并默认直接启动 focus-fixed Codex。
 - 之后在 UI 切换到 provider B，已经运行的 A 仍使用自己的快照；再次执行 `codex` 才会采用 B。
 - 因此两个终端可以分别保持 provider A 和 provider B，互不改写对方正在使用的 home。
 - 在 Codex 内通过 `/model` 修改模型后，正常退出或按 `Ctrl+C` 返回 launcher 时，模型和 reasoning effort 会写回启动该进程的 provider，而不是退出时 UI 当前选中的 provider。
@@ -15,19 +15,21 @@
 
 ### 启动
 
-`scripts/invoke-ccswitch-codex.ps1` 每次运行时调用 `scripts/materialize-ccswitch-codex-run.ps1`：
+普通新会话由 `scripts/invoke-ccswitch-codex.ps1` 调用 `scripts/materialize-ccswitch-codex-run.ps1`；`resume` 会复用 session 所属的原 run home，单参数根级 `--version`、`-V`、`--help`、`-h` 则走无状态 fast path：
 
 1. 对照 `~\.cc-switch\settings.json` 的 `currentProviderCodex` 与 `~\.cc-switch\cc-switch.db` 的当前 Codex provider。
 2. 从同一份稳定的数据库快照读取 provider 配置、认证信息和 endpoint；切换状态短暂不一致时会重试，无法取得一致状态则停止启动。
-3. 在 `~\.prodex\manual-homes\ccswitch-runs\ccswitch-run-*` 下发布新的 run home，写入 `config.toml`、`auth.json` 和 `run-provider.json`，并创建 `<run home>\.prodex-runtime`。
-4. 临时将 `PRODEX_HOME` 指向该 run 的 `.prodex-runtime`，通过官方 `prodex profile add <profile> --codex-home <run home>` 注册唯一 profile。
-5. launcher 再以同一个私有 `PRODEX_HOME` 执行 `prodex run --profile <profile> --no-auto-rotate --full-access`。启动链不读取或改写全局 `~\.prodex\state.json`。
+3. 在 `~\.prodex\manual-homes\ccswitch-runs\ccswitch-run-*` 下发布新的 run home，写入 `config.toml`、`auth.json` 和 `run-provider.json`，并创建用于兼容模型持久化的空 `<run home>\.prodex-runtime`。
+4. 默认 `direct` 模式设置 `CODEX_HOME=<run home>`，清除 `PRODEX_CODEX_BIN`、`PRODEX_HOME` 和可能串号的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_API_BASE`，再直接执行 focus-fixed Codex；不会注册或启动 Prodex。
+5. 仅当进程环境显式设置 `CCSWITCH_CODEX_LAUNCH_MODE=prodex` 时，才在私有 `.prodex-runtime` 中注册唯一 profile 并执行原有 `prodex run --profile ... --full-access` 回滚链。两种模式都不读取或改写全局 `~\.prodex\state.json`。
 
 `run-provider.json` 保存 provider 身份、启动时的模型基线和配置摘要，不保存明文密钥。后续 UI 切换不会重写已经发布的 run home。
 
+四个单参数根级诊断请求直接调用 `~\.codex\bin\codex-focusfixed-current.txt` 指向的 Codex 可执行文件，不启动 Prodex、不创建 run home，也不执行模型回写。诊断 flag 与任何其他参数组合时仍走完整启动链。
+
 ### 退出
 
-launcher 在 Prodex 返回时记录 UTC ticks，并在退出处理中调用 `scripts/persist-run-model.ps1 -RunHome <本次 run home> -ExitOrder <ticks>`：
+launcher 在 Codex（或显式回滚时的 Prodex）返回后记录 UTC ticks，并在退出处理中调用 `scripts/persist-run-model.ps1 -RunHome <本次 run home> -ExitOrder <ticks>`：
 
 - 仅回写 run home 中相对 `run-provider.json` 启动基线发生变化的 `model` 或 `model_reasoning_effort`；未变化的字段保留 provider 当时的值。没有修改模型的旧窗口会跳过，不会把 provider 回滚到旧值。
 - provider 由本次 run metadata 确定。即使 A 退出时 UI 已切到 B，也只更新 A，不会更新 B。
@@ -59,7 +61,7 @@ launcher 在 Prodex 返回时记录 UTC ticks，并在退出处理中调用 `scr
 ## 前置条件
 
 - Windows 上已配置 CC Switch Codex provider，并存在 `~\.cc-switch\settings.json` 与 `~\.cc-switch\cc-switch.db`。
-- `prodex.ps1` 可从 `%APPDATA%\npm` 使用。
+- 默认 direct 模式不要求 Prodex；如需使用 `CCSWITCH_CODEX_LAUNCH_MODE=prodex` 回滚，`prodex.ps1` 必须可从 `%APPDATA%\npm` 使用。
 - `~\.codex\bin\codex-focusfixed-current.txt` 指向同目录下存在的 `.exe`。
 - PowerShell 7 或 Windows PowerShell 5.1 可用。
 - `python` 命令指向 Python 3.11 或更高版本；快照校验和模型回写会调用它。
@@ -108,18 +110,22 @@ powershell.exe -NoProfile -Command "Get-Command codex -All | Select-Object -Firs
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\integration.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\retention.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\provider-config-migration.ps1
 git diff --check
 ```
 
 常规 PowerShell 应优先解析到 profile 中的 `codex` 函数；`where.exe` 和无 profile PowerShell 应能看到 `~\.prodex\shims` 中的入口，而且该目录应排在 `%APPDATA%\npm` 之前。CMD 可运行 `where codex`，Git Bash 可运行 `type -a codex` 做同样检查。
 
-以下命令只检查版本，不发送模型请求，同时会完整经过一次“启动快照 -> Codex 退出 -> 模型回写检查”流程：
+以下命令只检查当前固定 Codex 可执行文件的版本，不发送模型请求，也不创建 run home：
 
 ```powershell
 codex --version
 ```
 
-检查最近一次 run metadata 和私有 Prodex home；不要输出 `auth.json`：
+该 fast path 也不会显示 Prodex 自身的更新横幅；使用 `prodex info` 查看 Prodex 当前版本与可用更新。
+
+常规交互或 `exec` 运行结束后，可检查最近一次 run metadata；不要输出 `auth.json`：
 
 ```powershell
 $run = Get-ChildItem "$env:USERPROFILE\.prodex\manual-homes\ccswitch-runs" -Directory |
@@ -128,10 +134,19 @@ $run = Get-ChildItem "$env:USERPROFILE\.prodex\manual-homes\ccswitch-runs" -Dire
 
 Get-Content -Raw -LiteralPath (Join-Path $run.FullName 'run-provider.json') |
   ConvertFrom-Json |
-  Select-Object profileName, codexHome, prodexHome, providerName, providerId, model, modelReasoningEffort, materializedAt
+  Select-Object launchMode, profileName, codexHome, prodexHome, providerName, providerId, model, modelReasoningEffort, materializedAt
 ```
 
-`prodexHome` 应等于 `<codexHome>\.prodex-runtime`，其 `state.json` 只包含本次 run 的 profile。若全局 `~\.prodex\state.json` 已存在，需要验证它未被启动链改写时，可在执行 `codex --version` 前后分别运行 `Get-FileHash "$env:USERPROFILE\.prodex\state.json"` 并比较 SHA-256。
+`prodexHome` 应等于 `<codexHome>\.prodex-runtime`。direct 模式下该目录没有 `state.json`；Prodex 回滚模式下 `state.json` 只包含本次 run 的 profile。若全局 `~\.prodex\state.json` 已存在，需要验证它未被常规启动链改写时，可在一次常规 Codex 启动前后分别运行 `Get-FileHash "$env:USERPROFILE\.prodex\state.json"` 并比较 SHA-256。
+
+临时回退到 Prodex：
+
+```powershell
+$env:CCSWITCH_CODEX_LAUNCH_MODE = 'prodex'
+codex
+```
+
+删除该进程环境变量即可恢复默认 direct 模式。
 
 在 `Get-ScheduledTask` 可用时检查两个项目 watcher。正常情况下没有输出；ACL 保护的旧任务可能保留，但必须是 `Disabled`：
 
@@ -162,5 +177,7 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-event-launcher.p
 - `scripts/sync-ccswitch-current-codex.ps1`：手动修复共享 `ccswitch-current` home 漂移。
 - `scripts/watch-ccswitch-sync.ps1` 与 `scripts/install-watcher-task.ps1`：旧的后台 watcher 实现，仅为迁移和历史诊断保留；最终架构不安装或启动它们。
 - `scripts/switch-codex-provider.ps1`：旧的显式切换路径，不是 UI 自动隔离的推荐入口。
+- `scripts/invoke-run-home-retention.ps1`：历史 run home 保留工具。默认 `MinimumAgeDays=30` 且只预览；仅 `-Apply` 才删除直属 `ccswitch-run-*`。Apply 使用系统 `%SystemRoot%\System32\fsutil.exe` 核验稳定 File ID；该工具缺失、身份核验或文件/进程枚举失败时均停止。永久保留近期目录、任何 session、`history.jsonl`、`state_*.sqlite*`、活跃进程引用和 reparse point。使用 `-Json` 输出机器可读报告。
+- `scripts/get-ccswitch-provider-config-migration.ps1`：只读检查 Codex provider 中待迁移的 `ask_for_approval` 与 `features.js_repl`，并用 TOML 解析验证候选变换。该工具没有写入模式；CC Switch 运行期间应通过 UI 修改 provider 源配置，不直接写活动 SQLite。
 
-最终运行链始终是启动事件创建独立 Codex/Prodex 快照，并在正常退出事件中按 run metadata 和退出序号回写模型；不使用后台 watcher。
+常规交互与 `exec` 运行链由启动事件创建独立 Codex 快照，默认直接启动 focus-fixed Codex，并在正常退出事件中按 run metadata 和退出序号回写模型；Prodex 仅作为显式回滚路径。四个单参数根级诊断请求走无状态 fast path，所有路径都不使用后台 watcher。

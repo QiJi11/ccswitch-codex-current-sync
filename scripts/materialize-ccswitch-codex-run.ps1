@@ -4,7 +4,9 @@ param(
     [string]$CcSwitchRoot = "",
     # Test/diagnostic override for the provider database; never changes CC Switch state.
     [string]$SourceDb = "",
-    [string]$ProdexScript = ""
+    [string]$ProdexScript = "",
+    [ValidateSet('direct', 'prodex')]
+    [string]$LaunchMode = 'prodex'
 )
 
 Set-StrictMode -Version Latest
@@ -446,6 +448,8 @@ try:
         raise RuntimeError("auth.json must contain a JSON object.")
     if metadata.get("schemaVersion") != 2:
         raise RuntimeError("run-provider.json schemaVersion must be 2.")
+    if metadata.get("launchMode") not in ("direct", "prodex"):
+        raise RuntimeError("run-provider.json launchMode must be direct or prodex.")
     if metadata.get("providerId") != provider_id:
         raise RuntimeError("run-provider.json providerId does not match the DB snapshot.")
     if Path(metadata.get("codexHome", "")).resolve() != final_home.resolve():
@@ -506,12 +510,13 @@ $metadata = [pscustomobject]@{
     authSha256 = $details.authSha256
     model = $details.model
     modelReasoningEffort = $details.modelReasoningEffort
+    launchMode = $LaunchMode
     materializedAt = (Get-Date).ToString('o')
 }
 
 New-Item -ItemType Directory -Path $RunHomesRoot -Force | Out-Null
 $published = $false
-$registered = $false
+$runtimeReady = $false
 try {
     New-Item -ItemType Directory -Path $stagingHome -ErrorAction Stop | Out-Null
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'config.toml') -Content ([string]$details.config)
@@ -531,21 +536,25 @@ try {
     [System.IO.Directory]::Move($verifiedStagingHome, $verifiedCodexHome)
     $published = $true
 
-    Register-ProdexProfile `
-        -ProfileName $profileName `
-        -CodexHome $codexHome `
-        -RunProdexHome $runProdexHome
-    $registered = $true
+    if ($LaunchMode -eq 'prodex') {
+        Register-ProdexProfile `
+            -ProfileName $profileName `
+            -CodexHome $codexHome `
+            -RunProdexHome $runProdexHome
+    } else {
+        New-Item -ItemType Directory -Path $runProdexHome -ErrorAction Stop | Out-Null
+    }
+    $runtimeReady = $true
 } catch {
     if (-not $published) {
         Remove-OwnedRunDirectory -Path $stagingHome -ExpectedName $stagingName
-    } elseif (-not $registered) {
+    } elseif (-not $runtimeReady) {
         Remove-OwnedRunDirectory -Path $codexHome -ExpectedName $profileName
     }
     throw
 }
 
-Write-Info ("materialized profile={0} home={1} provider={2} id={3} base_url={4}" -f `
-    $profileName, $codexHome, $details.provider.name, $details.provider.id, $details.provider.baseUrl)
+Write-Info ("materialized mode={0} profile={1} home={2} provider={3} id={4} base_url={5}" -f `
+    $LaunchMode, $profileName, $codexHome, $details.provider.name, $details.provider.id, $details.provider.baseUrl)
 
 $metadata | ConvertTo-Json -Depth 8 -Compress

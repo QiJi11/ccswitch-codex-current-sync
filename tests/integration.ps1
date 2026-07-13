@@ -24,6 +24,7 @@ $script:OriginalEnvironment = @{
     PRODEX_HOME = [Environment]::GetEnvironmentVariable('PRODEX_HOME', 'Process')
     PRODEX_SHARED_CODEX_HOME = [Environment]::GetEnvironmentVariable('PRODEX_SHARED_CODEX_HOME', 'Process')
     PRODEX_CODEX_BIN = [Environment]::GetEnvironmentVariable('PRODEX_CODEX_BIN', 'Process')
+    CCSWITCH_CODEX_LAUNCH_MODE = [Environment]::GetEnvironmentVariable('CCSWITCH_CODEX_LAUNCH_MODE', 'Process')
 }
 $script:ProdexScript = Join-Path $script:OriginalAppData 'npm\prodex.ps1'
 $script:CodexBinary = $script:OriginalEnvironment.PRODEX_CODEX_BIN
@@ -134,6 +135,7 @@ function Set-CaseEnvironment {
     $env:PRODEX_HOME = $Case.ProdexRoot
     $env:PRODEX_SHARED_CODEX_HOME = $Case.SharedCodexHome
     $env:PRODEX_CODEX_BIN = $script:CodexBinary
+    $env:CCSWITCH_CODEX_LAUNCH_MODE = 'prodex'
 }
 
 function Restore-OriginalEnvironment {
@@ -510,13 +512,17 @@ function Get-ProviderState {
 }
 
 function Invoke-Materialize {
-    param([Parameter(Mandatory = $true)]$Case)
+    param(
+        [Parameter(Mandatory = $true)]$Case,
+        [ValidateSet('direct', 'prodex')][string]$LaunchMode = 'prodex'
+    )
 
     Set-CaseEnvironment -Case $Case
     $output = @(& $script:MaterializeSource `
         -Quiet `
         -CcSwitchRoot $Case.CcSwitchRoot `
-        -ProdexScript $script:ProdexScript)
+        -ProdexScript $script:ProdexScript `
+        -LaunchMode $LaunchMode)
     $jsonLine = @($output | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1)
     Assert-Equal -Expected 1 -Actual $jsonLine.Count -Because 'materialize must return one final JSON metadata line'
     return ($jsonLine[0] | ConvertFrom-Json)
@@ -714,6 +720,13 @@ function ConvertTo-GitBashPath {
     return $fullPath
 }
 
+function Get-ExpectedTrustedProjectOverride {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $normalizedRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\').ToLowerInvariant()
+    return "projects={ '$normalizedRoot' = { trust_level = 'trusted' } }"
+}
+
 function New-LauncherFixture {
     $case = New-TestCase -Name 'launcher'
     $binRoot = Join-Path $case.ProdexRoot 'bin'
@@ -739,12 +752,15 @@ function New-LauncherFixture {
         [IO.Directory]::CreateDirectory($directory) | Out-Null
     }
     Copy-Item -LiteralPath $script:LauncherSource -Destination $launcherPath -Force
-    Write-Utf8NoBom -Path $fixedBinary -Content ''
+    Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\curl.exe') -Destination $fixedBinary -Force
     Write-Utf8NoBom -Path (Join-Path $codexBinRoot 'codex-focusfixed-current.txt') -Content $fixedBinary
 
 $fakeMaterialize = @'
 [CmdletBinding()]
-param([switch]$Quiet)
+param(
+    [switch]$Quiet,
+    [ValidateSet('direct', 'prodex')][string]$LaunchMode = 'prodex'
+)
 [IO.File]::WriteAllText($env:FAKE_MATERIALIZE_LOG, $env:PRODEX_HOME)
 $privateProdexHome = Join-Path $env:FAKE_RUN_HOME '.prodex-runtime'
 [IO.Directory]::CreateDirectory($privateProdexHome) | Out-Null
@@ -757,6 +773,7 @@ $privateProdexHome = Join-Path $env:FAKE_RUN_HOME '.prodex-runtime'
     providerName = 'Provider A'
     model = $null
     modelReasoningEffort = 'ultra'
+    launchMode = $LaunchMode
 } | ConvertTo-Json -Compress
 '@
     $fakePersist = @'
@@ -872,6 +889,7 @@ function Get-LauncherEnvironment {
         PRODEX_HOME = $Case.ProdexRoot
         PRODEX_SHARED_CODEX_HOME = $Case.SharedCodexHome
         PRODEX_CODEX_BIN = $script:CodexBinary
+        CCSWITCH_CODEX_LAUNCH_MODE = 'prodex'
         FAKE_RUN_HOME = $Case.RunHome
         FAKE_MATERIALIZE_LOG = $ProdexLog + '.materialize-home.txt'
         FAKE_PRODEX_LOG = $ProdexLog
@@ -983,6 +1001,20 @@ try {
             -Because 'switching to B must not rewrite A auth'
         Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $snapshotB.codexHome 'auth.json') -Raw) -like '*TEST_TOKEN_PROVIDER_B*') `
             -Because 'provider B snapshot must contain only the fixture B auth source'
+    }
+
+    Invoke-TestCase -Name 'direct_materialization_skips_prodex_profile_registration' -Body {
+        $case = New-TestCase -Name 'direct-materialize'
+        $snapshot = Invoke-Materialize -Case $case -LaunchMode direct
+
+        Assert-Equal -Expected 'direct' -Actual ([string]$snapshot.launchMode) `
+            -Because 'direct materialization must record its launch mode'
+        Assert-True -Condition (Test-Path -LiteralPath $snapshot.codexHome -PathType Container) `
+            -Because 'direct materialization must publish the Codex home'
+        Assert-True -Condition (Test-Path -LiteralPath $snapshot.prodexHome -PathType Container) `
+            -Because 'direct materialization must preserve the persistence-compatible runtime path'
+        Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $snapshot.prodexHome 'state.json'))) `
+            -Because 'direct materialization must not register a Prodex profile'
     }
 
     Invoke-TestCase -Name 'settings_database_mismatch_fails_closed' -Body {
@@ -1355,13 +1387,41 @@ try {
             -Because 'failed model removal must not change provider settings'
     }
 
+    Invoke-TestCase -Name 'launcher_defaults_to_direct_without_prodex' -Body {
+        $case = New-LauncherFixture
+        Set-CaseEnvironment -Case $case
+        $prodexLog = Join-Path $case.Root 'prodex-direct-default.json'
+        $persistLog = Join-Path $case.Root 'persist-direct-default.log'
+        $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+        $environment.CCSWITCH_CODEX_LAUNCH_MODE = ''
+        $process = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath, '--probe') `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $environment
+        $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
+
+        Assert-Equal -Expected 2 -Actual $launchResult.ExitCode `
+            -Because 'the direct fixture binary must receive the Codex-only arguments'
+        Assert-True -Condition ($launchResult.StandardOutput -like '*mode=direct*') `
+            -Because 'the launcher summary must report direct mode'
+        Assert-True -Condition (-not (Test-Path -LiteralPath $prodexLog)) `
+            -Because 'default direct mode must not invoke Prodex'
+        Assert-True -Condition (Test-Path -LiteralPath ($prodexLog + '.materialize-home.txt')) `
+            -Because 'default direct mode must still materialize a provider snapshot'
+        Assert-True -Condition (Test-Path -LiteralPath $persistLog) `
+            -Because 'default direct mode must still persist run model state'
+    }
+
     Invoke-TestCase -Name 'launcher_surfaces_preserve_arguments_default_cwd_and_exit_code' -Body {
         $case = New-LauncherFixture
         Set-CaseEnvironment -Case $case
         $payloadArguments = @('--probe', 'two words', 'tail')
+        $trustedRoot = Join-Path $case.UserRoot 'Documents\Codex-Contexts'
+        $trustOverride = Get-ExpectedTrustedProjectOverride -ProjectRoot $trustedRoot
         $expectedProdexArguments = @(
             'run', '--profile', 'fixture-profile', '--no-auto-rotate', '--full-access',
-            '--cd', (Join-Path $case.UserRoot 'Documents\Codex-Contexts')
+            '-c', $trustOverride, '--cd', $trustedRoot
         ) + $payloadArguments
 
         foreach ($variant in Get-LaunchSurfaceVariants -Case $case) {
@@ -1384,7 +1444,7 @@ try {
             Assert-True -Condition (Test-Path -LiteralPath $persistLog -PathType Leaf) -Because "$($variant.Name) must invoke persistence"
             $record = Get-Content -LiteralPath $prodexLog -Raw | ConvertFrom-Json
             Assert-SequenceEqual -Expected $expectedProdexArguments -Actual @($record.arguments) `
-                -Because "$($variant.Name) must preserve arguments and inject only the default cwd"
+                -Because "$($variant.Name) must preserve arguments and trust only the default workspace"
             Assert-Equal -Expected $case.FixedBinary -Actual ([string]$record.codexBin) `
                 -Because "$($variant.Name) must set the focus-fixed Codex binary"
             Assert-Equal -Expected (Join-Path $case.RunHome '.prodex-runtime') -Actual ([string]$record.prodexHome) `
@@ -1394,12 +1454,87 @@ try {
         }
     }
 
+    Invoke-TestCase -Name 'single_root_diagnostic_flag_bypasses_materialize_prodex_and_persist' -Body {
+        $case = New-LauncherFixture
+        Set-CaseEnvironment -Case $case
+        $runHomesBefore = @(Get-RunDirectories -Case $case)
+        $allVariants = @(Get-LaunchSurfaceVariants -Case $case)
+        $directVariant = @($allVariants | Where-Object Name -eq 'PowerShell 7 launcher')[0]
+
+        foreach ($flag in @('--version', '-V', '--help', '-h')) {
+            $directHandle = Start-CapturedProcess `
+                -FilePath $case.FixedBinary `
+                -Arguments @($flag) `
+                -WorkingDirectory $case.UserRoot
+            $directResult = Complete-CapturedProcess -Handle $directHandle -TimeoutMilliseconds 30000
+            $variants = if ($flag -ceq '--version') { $allVariants } else { @($directVariant) }
+
+            foreach ($variant in $variants) {
+                $safeFlag = $flag -replace '[^A-Za-z0-9_.-]', '-'
+                $safeVariant = $variant.Name -replace '[^A-Za-z0-9_.-]', '-'
+                $prodexLog = Join-Path $case.Root ("prodex-fast-{0}-{1}.json" -f $safeFlag, $safeVariant)
+                $persistLog = Join-Path $case.Root ("persist-fast-{0}-{1}.log" -f $safeFlag, $safeVariant)
+                $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+                $launchHandle = Start-CapturedProcess `
+                    -FilePath $variant.FilePath `
+                    -Arguments (@($variant.Arguments) + $flag) `
+                    -WorkingDirectory $case.UserRoot `
+                    -Environment $environment
+                $launchResult = Complete-CapturedProcess -Handle $launchHandle -TimeoutMilliseconds 30000
+
+                Assert-Equal -Expected $directResult.ExitCode -Actual $launchResult.ExitCode `
+                    -Because "$($variant.Name) $flag fast path must preserve the native Codex exit code"
+                Assert-Equal -Expected $directResult.StandardOutput -Actual $launchResult.StandardOutput `
+                    -Because "$($variant.Name) $flag fast path must preserve native Codex stdout"
+                Assert-Equal -Expected $directResult.StandardError -Actual $launchResult.StandardError `
+                    -Because "$($variant.Name) $flag fast path must preserve native Codex stderr"
+                Assert-True -Condition (-not (Test-Path -LiteralPath $prodexLog)) `
+                    -Because "$($variant.Name) $flag fast path must not launch Prodex"
+                Assert-True -Condition (-not (Test-Path -LiteralPath ($prodexLog + '.materialize-home.txt'))) `
+                    -Because "$($variant.Name) $flag fast path must not materialize a run home"
+                Assert-True -Condition (-not (Test-Path -LiteralPath $persistLog)) `
+                    -Because "$($variant.Name) $flag fast path must not invoke persistence"
+            }
+        }
+
+        Assert-SequenceEqual -Expected $runHomesBefore -Actual @(Get-RunDirectories -Case $case) `
+            -Because 'root diagnostic fast paths must not add run homes'
+    }
+
+    Invoke-TestCase -Name 'diagnostic_flag_with_extra_argument_still_uses_prodex' -Body {
+        $case = New-LauncherFixture
+        Set-CaseEnvironment -Case $case
+        $prodexLog = Join-Path $case.Root 'prodex-help-with-extra.json'
+        $persistLog = Join-Path $case.Root 'persist-help-with-extra.log'
+        $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+        $process = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath,
+                '--help', '--probe'
+            ) `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $environment
+        $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
+
+        Assert-Equal -Expected 37 -Actual $launchResult.ExitCode `
+            -Because 'a diagnostic flag plus another argument must remain on the Prodex path'
+        Assert-True -Condition (Test-Path -LiteralPath $prodexLog -PathType Leaf) `
+            -Because 'the non-root diagnostic request must launch Prodex'
+        Assert-True -Condition (Test-Path -LiteralPath ($prodexLog + '.materialize-home.txt') -PathType Leaf) `
+            -Because 'the non-root diagnostic request must materialize a run home'
+        Assert-True -Condition (Test-Path -LiteralPath $persistLog -PathType Leaf) `
+            -Because 'the non-root diagnostic request must persist its run state'
+    }
+
     Invoke-TestCase -Name 'lowercase_config_flag_does_not_suppress_default_working_directory' -Body {
         $case = New-LauncherFixture
         Set-CaseEnvironment -Case $case
         $prodexLog = Join-Path $case.Root 'prodex-lowercase-config.json'
         $persistLog = Join-Path $case.Root 'persist-lowercase-config.log'
         $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+        $trustedRoot = Join-Path $case.UserRoot 'Documents\Codex-Contexts'
+        $trustOverride = Get-ExpectedTrustedProjectOverride -ProjectRoot $trustedRoot
         $process = Start-CapturedProcess `
             -FilePath $script:Pwsh `
             -Arguments @(
@@ -1415,11 +1550,40 @@ try {
         $record = Get-Content -LiteralPath $prodexLog -Raw | ConvertFrom-Json
         $expectedArguments = @(
             'run', '--profile', 'fixture-profile', '--no-auto-rotate', '--full-access',
-            '--cd', (Join-Path $case.UserRoot 'Documents\Codex-Contexts'),
+            '-c', $trustOverride, '--cd', $trustedRoot,
             '-c', 'model_reasoning_effort="high"', '--probe'
         )
         Assert-SequenceEqual -Expected $expectedArguments -Actual @($record.arguments) `
             -Because 'lowercase -c must not be treated as the case-sensitive -C working-directory flag'
+    }
+
+    Invoke-TestCase -Name 'explicit_external_working_directory_does_not_gain_trust_override' -Body {
+        $case = New-LauncherFixture
+        Set-CaseEnvironment -Case $case
+        $externalRoot = Join-Path $case.Root 'external-project'
+        [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+        $prodexLog = Join-Path $case.Root 'prodex-external-cwd.json'
+        $persistLog = Join-Path $case.Root 'persist-external-cwd.log'
+        $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+        $process = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath,
+                '-C', $externalRoot, '--probe'
+            ) `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $environment
+        $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
+
+        Assert-Equal -Expected 37 -Actual $launchResult.ExitCode `
+            -Because 'an explicit external working directory must still launch normally'
+        $record = Get-Content -LiteralPath $prodexLog -Raw | ConvertFrom-Json
+        $expectedArguments = @(
+            'run', '--profile', 'fixture-profile', '--no-auto-rotate', '--full-access',
+            '-C', $externalRoot, '--probe'
+        )
+        Assert-SequenceEqual -Expected $expectedArguments -Actual @($record.arguments) `
+            -Because 'only the exact trusted workspace may receive a trust override'
     }
 
     Invoke-TestCase -Name 'inherited_private_prodex_home_uses_user_root_for_materialize_and_persist_bounds' -Body {

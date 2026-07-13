@@ -13,7 +13,12 @@ $PersistScript = Join-Path $ProdexRoot 'bin\persist-run-model.ps1'
 $ProdexPowerShellScript = Join-Path $env:APPDATA 'npm\prodex.ps1'
 $ProdexCommand = Join-Path $env:APPDATA 'npm\prodex.cmd'
 $PersistenceLog = Join-Path $ProdexRoot 'logs\ccswitch-event-launcher.log'
+$TrustedWorkspaceRoot = Join-Path $UserRoot 'Documents\Codex-Contexts'
 $CodexArguments = @($args)
+$LaunchEnvironmentNames = @(
+    'PRODEX_CODEX_BIN', 'PRODEX_HOME', 'CODEX_HOME',
+    'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_BASE'
+)
 
 function Disable-CodexFocusReporting {
     if ([Console]::IsOutputRedirected) {
@@ -35,6 +40,17 @@ function Get-LastExitCode {
         return $null
     }
     return $exitCodeVariable.Value
+}
+
+function Get-CodexLaunchMode {
+    $configuredMode = [Environment]::GetEnvironmentVariable('CCSWITCH_CODEX_LAUNCH_MODE', 'Process')
+    if ([string]::IsNullOrWhiteSpace($configuredMode)) { return 'direct' }
+
+    $normalizedMode = $configuredMode.Trim().ToLowerInvariant()
+    if ($normalizedMode -notin @('direct', 'prodex')) {
+        throw "CCSWITCH_CODEX_LAUNCH_MODE must be 'direct' or 'prodex'."
+    }
+    return $normalizedMode
 }
 
 function Get-FocusFixedCodexBin {
@@ -102,6 +118,76 @@ function Get-CodexLaunchArguments {
         return @($Arguments)
     }
     return @('--cd', $defaultWorkingRoot) + @($Arguments)
+}
+
+function Test-CodexNativeDiagnosticRequest {
+    param([object[]]$Arguments)
+
+    return $Arguments.Count -eq 1 -and
+        @('--version', '-V', '--help', '-h') -ccontains [string]$Arguments[0]
+}
+
+function Find-CodexWorkingRootArgument {
+    param([object[]]$Arguments)
+
+    $workingRoot = $null
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = [string]$Arguments[$index]
+        if ($argument -eq '--') { break }
+
+        if ($argument -eq '--cd' -or $argument -ceq '-C') {
+            if ($index + 1 -ge $Arguments.Count) { return '' }
+            $workingRoot = [string]$Arguments[$index + 1]
+            $index++
+            continue
+        }
+        if ($argument.StartsWith('--cd=', [StringComparison]::Ordinal)) {
+            $workingRoot = $argument.Substring('--cd='.Length)
+        }
+    }
+    return $workingRoot
+}
+
+function Resolve-CodexWorkingRoot {
+    param([object[]]$Arguments)
+
+    $workingRoot = Find-CodexWorkingRootArgument -Arguments $Arguments
+    if ($null -eq $workingRoot) {
+        $workingRoot = (Get-Location).ProviderPath
+    }
+    if ([string]::IsNullOrWhiteSpace($workingRoot)) { return $null }
+
+    try {
+        if (-not [IO.Path]::IsPathRooted($workingRoot)) {
+            $workingRoot = Join-Path (Get-Location).ProviderPath $workingRoot
+        }
+        return [IO.Path]::GetFullPath($workingRoot).TrimEnd('\')
+    } catch {
+        # Invalid -C values still belong to Codex; failed resolution only disables auto-trust.
+        return $null
+    }
+}
+
+function New-TrustedProjectConfigOverride {
+    param([Parameter(Mandatory = $true)][string]$ProjectRoot)
+
+    $normalizedRoot = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\').ToLowerInvariant()
+    return "projects={ '$normalizedRoot' = { trust_level = 'trusted' } }"
+}
+
+function Add-TrustedWorkspaceOverride {
+    param([object[]]$Arguments)
+
+    $workingRoot = Resolve-CodexWorkingRoot -Arguments $Arguments
+    if ([string]::IsNullOrWhiteSpace($workingRoot)) { return @($Arguments) }
+
+    $trustedRoot = [IO.Path]::GetFullPath($TrustedWorkspaceRoot).TrimEnd('\')
+    if (-not [string]::Equals($workingRoot, $trustedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        return @($Arguments)
+    }
+
+    $override = New-TrustedProjectConfigOverride -ProjectRoot $trustedRoot
+    return @('-c', $override) + @($Arguments)
 }
 
 function Get-ProdexLauncher {
@@ -293,12 +379,14 @@ function Add-SessionIdToArguments {
 }
 
 function Get-MaterializedSnapshot {
+    param([Parameter(Mandatory = $true)][string]$LaunchMode)
+
     if (-not (Test-Path -LiteralPath $MaterializeScript -PathType Leaf)) {
         throw "Missing cc-switch materialize script: $MaterializeScript"
     }
 
     $global:LASTEXITCODE = 0
-    $materializeOutput = @(& $MaterializeScript -Quiet)
+    $materializeOutput = @(& $MaterializeScript -Quiet -LaunchMode $LaunchMode)
     $materializeExitCode = Get-LastExitCode
     if ($materializeExitCode -notin @($null, 0)) {
         throw "cc-switch materialize failed with exit code $materializeExitCode."
@@ -328,7 +416,10 @@ function Get-SafeConsoleText {
 }
 
 function Write-LaunchSummary {
-    param([Parameter(Mandatory = $true)]$Snapshot)
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][string]$LaunchMode
+    )
 
     $provider = Get-SafeConsoleText -Text $Snapshot.providerName
     $model = if ([string]::IsNullOrWhiteSpace([string]$Snapshot.model)) {
@@ -337,7 +428,7 @@ function Write-LaunchSummary {
         Get-SafeConsoleText -Text $Snapshot.model
     }
     $effort = Get-SafeConsoleText -Text $Snapshot.modelReasoningEffort
-    Write-Host ("[cc-switch] provider={0} model={1} reasoning={2}" -f $provider, $model, $effort)
+    Write-Host ("[cc-switch] mode={0} provider={1} model={2} reasoning={3}" -f $LaunchMode, $provider, $model, $effort)
 }
 
 function Write-PersistenceFailure {
@@ -394,26 +485,25 @@ function Invoke-RunModelPersistence {
     }
 }
 
-function Restore-ProcessEnvironment {
-    param(
-        [AllowNull()][string]$PreviousProdexCodexBin,
-        [AllowNull()][string]$PreviousProdexHome
-    )
+function Get-ProcessEnvironmentSnapshot {
+    param([Parameter(Mandatory = $true)][string[]]$Names)
 
-    if ($null -eq $PreviousProdexCodexBin) {
-        Remove-Item -LiteralPath 'Env:\PRODEX_CODEX_BIN' -ErrorAction SilentlyContinue
-    } else {
-        $env:PRODEX_CODEX_BIN = $PreviousProdexCodexBin
+    $snapshot = @{}
+    foreach ($name in $Names) {
+        $snapshot[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
     }
-    if ($null -eq $PreviousProdexHome) {
-        Remove-Item -LiteralPath 'Env:\PRODEX_HOME' -ErrorAction SilentlyContinue
-    } else {
-        $env:PRODEX_HOME = $PreviousProdexHome
+    return $snapshot
+}
+
+function Restore-ProcessEnvironment {
+    param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
+
+    foreach ($name in $Snapshot.Keys) {
+        [Environment]::SetEnvironmentVariable($name, $Snapshot[$name], 'Process')
     }
 }
 
-$previousProdexCodexBin = [Environment]::GetEnvironmentVariable('PRODEX_CODEX_BIN', 'Process')
-$previousProdexHome = [Environment]::GetEnvironmentVariable('PRODEX_HOME', 'Process')
+$launchEnvironment = Get-ProcessEnvironmentSnapshot -Names $LaunchEnvironmentNames
 $materializedSnapshot = $null
 $codexExitCode = 1
 $launchOutcomeHandled = $false
@@ -422,43 +512,61 @@ $exitOrder = [long]0
 try {
     Disable-CodexFocusReporting
     $focusFixedCodexBin = Get-FocusFixedCodexBin
-    $env:PRODEX_CODEX_BIN = $focusFixedCodexBin
-    # Materialization belongs to the user-level Prodex root, not an inherited run-scoped home.
-    $env:PRODEX_HOME = $ProdexRoot
-    $prodexLauncher = Get-ProdexLauncher
-
-    $historicalSessionRequest = Get-HistoricalSessionRequest -Arguments $CodexArguments
-    $materializedSnapshot = if ($null -eq $historicalSessionRequest) {
-        Get-MaterializedSnapshot
-    } elseif ($null -ne $historicalSessionRequest.sessionId -or
-        [bool]$historicalSessionRequest.useLatest -or
-        [bool]$historicalSessionRequest.diagnostic) {
-        Get-HistoricalSessionSnapshot -SessionId $historicalSessionRequest.sessionId
+    $launchMode = Get-CodexLaunchMode
+    if (Test-CodexNativeDiagnosticRequest -Arguments $CodexArguments) {
+        $global:LASTEXITCODE = 0
+        & $focusFixedCodexBin @CodexArguments
+        $lastExitCode = Get-LastExitCode
+        $codexExitCode = if ($null -eq $lastExitCode) { 0 } else { [int]$lastExitCode }
+        $launchOutcomeHandled = $true
     } else {
-        $selectedSession = Select-HistoricalSessionCandidate
-        $CodexArguments = @(Add-SessionIdToArguments `
-            -Arguments $CodexArguments `
-            -CommandIndex ([int]$historicalSessionRequest.commandIndex) `
-            -SessionId ([string]$selectedSession.sessionId))
-        $selectedSession.snapshot
+        $env:PRODEX_CODEX_BIN = $focusFixedCodexBin
+        # Materialization belongs to the user-level Prodex root, not an inherited run-scoped home.
+        $env:PRODEX_HOME = $ProdexRoot
+
+        $historicalSessionRequest = Get-HistoricalSessionRequest -Arguments $CodexArguments
+        $materializedSnapshot = if ($null -eq $historicalSessionRequest) {
+            Get-MaterializedSnapshot -LaunchMode $launchMode
+        } elseif ($null -ne $historicalSessionRequest.sessionId -or
+            [bool]$historicalSessionRequest.useLatest -or
+            [bool]$historicalSessionRequest.diagnostic) {
+            Get-HistoricalSessionSnapshot -SessionId $historicalSessionRequest.sessionId
+        } else {
+            $selectedSession = Select-HistoricalSessionCandidate
+            $CodexArguments = @(Add-SessionIdToArguments `
+                -Arguments $CodexArguments `
+                -CommandIndex ([int]$historicalSessionRequest.commandIndex) `
+                -SessionId ([string]$selectedSession.sessionId))
+            $selectedSession.snapshot
+        }
+        Write-LaunchSummary -Snapshot $materializedSnapshot -LaunchMode $launchMode
+        $launchArguments = @(Get-CodexLaunchArguments -Arguments $CodexArguments)
+        $launchArguments = @(Add-TrustedWorkspaceOverride -Arguments $launchArguments)
+        $global:LASTEXITCODE = 0
+        if ($launchMode -eq 'direct') {
+            $env:CODEX_HOME = [string]$materializedSnapshot.codexHome
+            foreach ($name in @('PRODEX_CODEX_BIN', 'PRODEX_HOME', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_BASE')) {
+                [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            }
+            & $focusFixedCodexBin --dangerously-bypass-approvals-and-sandbox @launchArguments
+        } else {
+            $prodexLauncher = Get-ProdexLauncher
+            $env:PRODEX_HOME = [string]$materializedSnapshot.prodexHome
+            $previousErrorActionPreference = $ErrorActionPreference
+            try {
+                # Prodex emits update notices on stderr; the run outcome is governed by its exit code.
+                $ErrorActionPreference = 'Continue'
+                & $prodexLauncher run --profile ([string]$materializedSnapshot.profileName) `
+                    --no-auto-rotate --full-access @launchArguments
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+        }
+        $exitOrder = [DateTime]::UtcNow.Ticks
+        $lastExitCode = Get-LastExitCode
+        $codexExitCode = if ($null -eq $lastExitCode) { 0 } else { [int]$lastExitCode }
+        $launchOutcomeHandled = $true
     }
-    Write-LaunchSummary -Snapshot $materializedSnapshot
-    $launchArguments = @(Get-CodexLaunchArguments -Arguments $CodexArguments)
-    $env:PRODEX_HOME = [string]$materializedSnapshot.prodexHome
-    $global:LASTEXITCODE = 0
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        # Prodex emits update notices on stderr; the run outcome is governed by its exit code.
-        $ErrorActionPreference = 'Continue'
-        & $prodexLauncher run --profile ([string]$materializedSnapshot.profileName) `
-            --no-auto-rotate --full-access @launchArguments
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    $exitOrder = [DateTime]::UtcNow.Ticks
-    $lastExitCode = Get-LastExitCode
-    $codexExitCode = if ($null -eq $lastExitCode) { 0 } else { [int]$lastExitCode }
-    $launchOutcomeHandled = $true
 } catch [System.Management.Automation.PipelineStoppedException] {
     $exitOrder = [DateTime]::UtcNow.Ticks
     $lastExitCode = Get-LastExitCode
@@ -474,9 +582,7 @@ try {
     $codexExitCode = 1
     $launchOutcomeHandled = $true
 } finally {
-    Restore-ProcessEnvironment `
-        -PreviousProdexCodexBin $previousProdexCodexBin `
-        -PreviousProdexHome $previousProdexHome
+    Restore-ProcessEnvironment -Snapshot $launchEnvironment
     if ($null -ne $materializedSnapshot) {
         if ($exitOrder -le 0) {
             $exitOrder = [DateTime]::UtcNow.Ticks
