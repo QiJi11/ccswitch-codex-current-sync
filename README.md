@@ -10,6 +10,7 @@
 - 正常退出或 `Ctrl+C` 后，把变化过的 `model` 和 `model_reasoning_effort` 写回正确 provider。
 - 为 PowerShell、无 profile PowerShell、CMD 和 Git Bash 提供统一入口。
 - 提供认证规范化、只读审计、历史 run home 保留和 provider 配置迁移工具。
+- 交互启动每 6 小时检查一次 Codex 稳定版；发现更新时提示，机器可读命令不插入提示。
 
 不支持运行中热切换。要采用 CC Switch 新选择的 provider，需要结束当前 Codex 后重新启动。
 
@@ -45,6 +46,7 @@ codex --version
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\integration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\retention.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\provider-config-migration.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-update-check.ps1
 python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\normalize-ccswitch-codex-auth.py
 git diff --check
 ```

@@ -13,6 +13,7 @@
 - preview-first 安装、卸载和 run home 保留。
 - provider 配置迁移预检。
 - 第三方与官方 provider 认证规范化和只读审计。
+- 带缓存的 Codex 稳定版更新提示，并隔离机器可读命令输出。
 
 ## 验证覆盖
 
@@ -26,6 +27,7 @@
 - session UUID、`--last` 和交互 picker 恢复。
 - retention 的年龄、session、history、state、reparse point 和活跃引用边界。
 - provider 配置迁移的正向、无变化和非法配置路径。
+- 更新可用、无需更新、拒绝降级、断网缓存和交互/机器输出边界。
 
 ## 待处理
 

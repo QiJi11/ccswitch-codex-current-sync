@@ -17,6 +17,7 @@ $UserRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
 $ProdexRoot = Join-Path $UserRoot '.prodex'
 $BinDirectory = Join-Path $ProdexRoot 'bin'
 $ShimDirectory = Join-Path $ProdexRoot 'shims'
+$CodexBinDirectory = Join-Path $UserRoot '.codex\bin'
 $WatcherTaskNames = @('ccswitch-codex-current-watcher', 'ccswitch-codex-current-watcher-user')
 
 function Write-InstallAction {
@@ -327,6 +328,9 @@ function Install-LauncherFiles {
     )) {
         Copy-ManagedFile -SourcePath (Join-Path $PSScriptRoot $scriptName) -DestinationPath (Join-Path $BinDirectory $scriptName)
     }
+    Copy-ManagedFile `
+        -SourcePath (Join-Path $PSScriptRoot 'check-codex-update.ps1') `
+        -DestinationPath (Join-Path $CodexBinDirectory 'check-codex-update.ps1')
     foreach ($shimName in @('codex.ps1', 'codex.cmd', 'codex')) {
         Copy-ManagedFile -SourcePath (Join-Path $PSScriptRoot "shims\$shimName") -DestinationPath (Join-Path $ShimDirectory $shimName)
     }

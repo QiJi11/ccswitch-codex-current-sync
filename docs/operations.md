@@ -57,6 +57,18 @@ codex --version
 
 该命令不创建 run home、不启动 Prodex，也不执行模型写回。
 
+### 更新提示
+
+普通交互启动最多每 6 小时从 npm registry 检查一次 `@openai/codex` 的稳定版，并缓存结果到 `%USERPROFILE%\.codex\codex-update-check.json`。发现新版本时显示提示，但不会自动安装。
+
+`exec`、`review` 等机器输出命令不执行该检查，避免污染 JSON 或脚本输出。手动只读检查：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.codex\bin\check-codex-update.ps1" -Json
+```
+
+升级前应审计精确版本并保留当前 focus-fixed 指针；不要直接运行 `npm update`。
+
 ### Run metadata
 
 ```powershell
@@ -80,6 +92,7 @@ Get-Content -Raw -LiteralPath $metadataPath |
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\integration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\retention.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\provider-config-migration.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-update-check.ps1
 python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\normalize-ccswitch-codex-auth.py
 git diff --check
 ```

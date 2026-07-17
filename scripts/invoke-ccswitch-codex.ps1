@@ -13,6 +13,7 @@ $PersistScript = Join-Path $ProdexRoot 'bin\persist-run-model.ps1'
 $ProdexPowerShellScript = Join-Path $env:APPDATA 'npm\prodex.ps1'
 $ProdexCommand = Join-Path $env:APPDATA 'npm\prodex.cmd'
 $PersistenceLog = Join-Path $ProdexRoot 'logs\ccswitch-event-launcher.log'
+$CodexUpdateCheckScript = Join-Path $UserRoot '.codex\bin\check-codex-update.ps1'
 $TrustedWorkspaceRoot = Join-Path $UserRoot 'Documents\Codex-Contexts'
 $CodexArguments = @($args)
 $LaunchEnvironmentNames = @(
@@ -125,6 +126,29 @@ function Test-CodexNativeDiagnosticRequest {
 
     return $Arguments.Count -eq 1 -and
         @('--version', '-V', '--help', '-h') -ccontains [string]$Arguments[0]
+}
+
+function Test-CodexUpdateNoticeRequest {
+    param([object[]]$Arguments)
+
+    $machineOutputCommands = @(
+        'exec', 'e', 'review', 'apply', 'a', 'login', 'logout', 'mcp', 'features',
+        'doctor', 'update', 'sandbox', 'completion', 'auth', 'app-server',
+        'mcp-server', 'exec-server', 'cloud'
+    )
+    return @($Arguments | Where-Object {
+        $machineOutputCommands -ccontains [string]$_
+    }).Count -eq 0
+}
+
+function Write-CodexUpdateNotice {
+    if (-not (Test-Path -LiteralPath $CodexUpdateCheckScript -PathType Leaf)) { return }
+    try {
+        & $CodexUpdateCheckScript
+    } catch {
+        # An optional network notice must never block or contaminate a Codex launch.
+        Write-Verbose "Codex update check failed; continuing launch: $($_.Exception.Message)"
+    }
 }
 
 function Find-CodexWorkingRootArgument {
@@ -520,6 +544,9 @@ try {
         $codexExitCode = if ($null -eq $lastExitCode) { 0 } else { [int]$lastExitCode }
         $launchOutcomeHandled = $true
     } else {
+        if (Test-CodexUpdateNoticeRequest -Arguments $CodexArguments) {
+            Write-CodexUpdateNotice
+        }
         $env:PRODEX_CODEX_BIN = $focusFixedCodexBin
         # Materialization belongs to the user-level Prodex root, not an inherited run-scoped home.
         $env:PRODEX_HOME = $ProdexRoot

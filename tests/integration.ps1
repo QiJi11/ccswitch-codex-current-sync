@@ -739,6 +739,7 @@ function New-LauncherFixture {
     $launcherPath = Join-Path $binRoot 'invoke-ccswitch-codex.ps1'
     $materializePath = Join-Path $binRoot 'materialize-ccswitch-codex-run.ps1'
     $persistPath = Join-Path $binRoot 'persist-run-model.ps1'
+    $updateCheckPath = Join-Path $codexBinRoot 'check-codex-update.ps1'
     $prodexPath = Join-Path $case.AppData 'npm\prodex.ps1'
 
     foreach ($directory in @(
@@ -840,6 +841,7 @@ $exitCode = [int]$env:FAKE_CODEX_EXIT
     $case | Add-Member -NotePropertyName HistoricalProdexHome -NotePropertyValue $historicalProdexHome
     $case | Add-Member -NotePropertyName HistoricalSessionId -NotePropertyValue $historicalSessionId
     $case | Add-Member -NotePropertyName FixedBinary -NotePropertyValue $fixedBinary
+    $case | Add-Member -NotePropertyName UpdateCheckPath -NotePropertyValue $updateCheckPath
     return $case
 }
 
@@ -1411,6 +1413,55 @@ try {
             -Because 'default direct mode must still materialize a provider snapshot'
         Assert-True -Condition (Test-Path -LiteralPath $persistLog) `
             -Because 'default direct mode must still persist run model state'
+    }
+
+    Invoke-TestCase -Name 'interactive_launcher_shows_update_notice_without_contaminating_exec' -Body {
+        $case = New-LauncherFixture
+        Set-CaseEnvironment -Case $case
+        $updateMarker = Join-Path $case.Root 'update-check-called.txt'
+        Write-Utf8NoBom -Path $case.UpdateCheckPath -Content @"
+[IO.File]::AppendAllText('$updateMarker', 'called' + [Environment]::NewLine)
+Write-Host '[Codex update] 0.144.6 available; current 0.144.5.'
+"@
+
+        $interactiveProdexLog = Join-Path $case.Root 'prodex-update-notice-interactive.json'
+        $interactivePersistLog = Join-Path $case.Root 'persist-update-notice-interactive.log'
+        $interactiveEnvironment = Get-LauncherEnvironment `
+            -Case $case -ProdexLog $interactiveProdexLog -PersistLog $interactivePersistLog
+        $interactiveProcess = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath) `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $interactiveEnvironment
+        $interactiveResult = Complete-CapturedProcess -Handle $interactiveProcess -TimeoutMilliseconds 30000
+
+        Assert-Equal -Expected 37 -Actual $interactiveResult.ExitCode `
+            -Because 'the update notice must not change the Codex exit code'
+        Assert-True -Condition ($interactiveResult.StandardOutput.Contains('[Codex update]')) `
+            -Because 'an interactive launch must show the update notice'
+        Assert-True -Condition (Test-Path -LiteralPath $updateMarker -PathType Leaf) `
+            -Because 'an interactive launch must invoke the update checker'
+
+        Remove-Item -LiteralPath $updateMarker -Force
+        $execProdexLog = Join-Path $case.Root 'prodex-update-notice-exec.json'
+        $execPersistLog = Join-Path $case.Root 'persist-update-notice-exec.log'
+        $execEnvironment = Get-LauncherEnvironment -Case $case -ProdexLog $execProdexLog -PersistLog $execPersistLog
+        $execProcess = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath,
+                'exec', '--json', '--probe'
+            ) `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $execEnvironment
+        $execResult = Complete-CapturedProcess -Handle $execProcess -TimeoutMilliseconds 30000
+
+        Assert-Equal -Expected 37 -Actual $execResult.ExitCode `
+            -Because 'suppressing the notice must preserve the exec exit code'
+        Assert-True -Condition (-not (Test-Path -LiteralPath $updateMarker)) `
+            -Because 'machine-readable exec must not invoke the update checker'
+        Assert-True -Condition (-not $execResult.StandardOutput.Contains('[Codex update]')) `
+            -Because 'machine-readable exec output must remain clean'
     }
 
     Invoke-TestCase -Name 'launcher_surfaces_preserve_arguments_default_cwd_and_exit_code' -Body {
