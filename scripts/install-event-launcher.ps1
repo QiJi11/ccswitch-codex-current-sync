@@ -323,7 +323,12 @@ function Install-LauncherFiles {
         'invoke-ccswitch-codex.ps1'
         'materialize-ccswitch-codex-run.ps1'
         'persist-run-model.ps1'
+        'watch-run-model.ps1'
+        'diagnose-codex-run-provider.py'
+        'persist-codex-fast-all-providers.py'
         'sync-ccswitch-current-codex.ps1'
+        'resolve-ccswitch-root.ps1'
+        'switch-codex-provider.ps1'
     )) {
         Copy-ManagedFile -SourcePath (Join-Path $PSScriptRoot $scriptName) -DestinationPath (Join-Path $BinDirectory $scriptName)
     }

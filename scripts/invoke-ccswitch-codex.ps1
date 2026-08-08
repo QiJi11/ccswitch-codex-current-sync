@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve-ccswitch-root.ps1')
 
 $UserRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     [Environment]::GetFolderPath('UserProfile')
@@ -10,15 +11,15 @@ $ProdexRoot = Join-Path $UserRoot '.prodex'
 $RunHomesRoot = Join-Path $ProdexRoot 'manual-homes\ccswitch-runs'
 $MaterializeScript = Join-Path $ProdexRoot 'bin\materialize-ccswitch-codex-run.ps1'
 $PersistScript = Join-Path $ProdexRoot 'bin\persist-run-model.ps1'
+$RunModelWatcherScript = Join-Path $ProdexRoot 'bin\watch-run-model.ps1'
 $ProdexPowerShellScript = Join-Path $env:APPDATA 'npm\prodex.ps1'
 $ProdexCommand = Join-Path $env:APPDATA 'npm\prodex.cmd'
 $PersistenceLog = Join-Path $ProdexRoot 'logs\ccswitch-event-launcher.log'
+$CodexUpdateCheckScript = Join-Path $UserRoot '.codex\bin\check-codex-update.ps1'
 $TrustedWorkspaceRoot = Join-Path $UserRoot 'Documents\Codex-Contexts'
 $CodexArguments = @($args)
-$LaunchEnvironmentNames = @(
-    'PRODEX_CODEX_BIN', 'PRODEX_HOME', 'CODEX_HOME',
-    'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_BASE'
-)
+$StaticLaunchEnvironmentNames = @('PRODEX_CODEX_BIN', 'PRODEX_HOME', 'CODEX_HOME')
+$ActiveCcSwitchRoot = $null
 
 function Disable-CodexFocusReporting {
     if ([Console]::IsOutputRedirected) {
@@ -56,6 +57,7 @@ function Get-CodexLaunchMode {
 function Get-FocusFixedCodexBin {
     $binRoot = Join-Path $UserRoot '.codex\bin'
     $pointerPath = Join-Path $binRoot 'codex-focusfixed-current.txt'
+    $metadataPath = Join-Path $binRoot 'codex-focusfixed-current.json'
     if (-not (Test-Path -LiteralPath $pointerPath -PathType Leaf)) {
         throw "Missing Codex focus-fixed pointer: $pointerPath"
     }
@@ -75,6 +77,18 @@ function Get-FocusFixedCodexBin {
     }
     if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
         throw "Codex focus-fixed binary does not exist: $resolvedPath"
+    }
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        throw "Missing Codex focus-fixed metadata: $metadataPath"
+    }
+
+    $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
+    $metadataPathValue = [IO.Path]::GetFullPath([string]$metadata.patchedExe)
+    if (-not [string]::Equals($resolvedPath, $metadataPathValue, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Codex focus-fixed pointer and metadata disagree. Run the focus patch updater."
+    }
+    if ([int]$metadata.enableAfter -ne 0 -or [int]$metadata.disableAfter -lt 1) {
+        throw "Codex focus-fixed metadata does not describe a verified focus patch."
     }
     return $resolvedPath
 }
@@ -125,6 +139,59 @@ function Test-CodexNativeDiagnosticRequest {
 
     return $Arguments.Count -eq 1 -and
         @('--version', '-V', '--help', '-h') -ccontains [string]$Arguments[0]
+}
+
+function Test-CodexExplicitSandboxRequest {
+    param([object[]]$Arguments)
+
+    $compactSandboxArguments = @('-sread-only', '-sworkspace-write', '-sdanger-full-access')
+    foreach ($rawArgument in $Arguments) {
+        $argument = [string]$rawArgument
+        if ($argument -ceq '--') { break }
+        if ($argument -ceq '--sandbox' -or $argument -ceq '-s') {
+            return $true
+        }
+        if ($argument.StartsWith('--sandbox=', [StringComparison]::Ordinal) -or
+            $argument.StartsWith('-s=', [StringComparison]::Ordinal) -or
+            $compactSandboxArguments -ccontains $argument) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-CodexBypassRequest {
+    param([object[]]$Arguments)
+
+    foreach ($rawArgument in $Arguments) {
+        $argument = [string]$rawArgument
+        if ($argument -ceq '--') { break }
+        if ($argument -ceq '--dangerously-bypass-approvals-and-sandbox') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-CodexUpdateNoticeRequest {
+    param([object[]]$Arguments)
+
+    $nonInteractiveCommands = @(
+        'exec', 'e', 'review', 'apply', 'a', 'login', 'logout', 'mcp', 'features',
+        'doctor', 'update', 'sandbox', 'completion', 'auth', 'app-server',
+        'mcp-server', 'exec-server', 'cloud'
+    )
+    return @($Arguments | Where-Object { $nonInteractiveCommands -ccontains [string]$_ }).Count -eq 0
+}
+
+function Write-CodexUpdateNotice {
+    if (-not (Test-Path -LiteralPath $CodexUpdateCheckScript -PathType Leaf)) { return }
+    try {
+        & $CodexUpdateCheckScript
+    } catch {
+        # Version checks must never block or contaminate a Codex launch.
+        Write-Verbose "Codex update check failed; continuing launch: $($_.Exception.Message)"
+    }
 }
 
 function Find-CodexWorkingRootArgument {
@@ -379,14 +446,17 @@ function Add-SessionIdToArguments {
 }
 
 function Get-MaterializedSnapshot {
-    param([Parameter(Mandatory = $true)][string]$LaunchMode)
+    param(
+        [Parameter(Mandatory = $true)][string]$LaunchMode,
+        [Parameter(Mandatory = $true)][string]$CcSwitchRoot
+    )
 
     if (-not (Test-Path -LiteralPath $MaterializeScript -PathType Leaf)) {
         throw "Missing cc-switch materialize script: $MaterializeScript"
     }
 
     $global:LASTEXITCODE = 0
-    $materializeOutput = @(& $MaterializeScript -Quiet -LaunchMode $LaunchMode)
+    $materializeOutput = @(& $MaterializeScript -Quiet -LaunchMode $LaunchMode -CcSwitchRoot $CcSwitchRoot)
     $materializeExitCode = Get-LastExitCode
     if ($materializeExitCode -notin @($null, 0)) {
         throw "cc-switch materialize failed with exit code $materializeExitCode."
@@ -431,18 +501,31 @@ function Write-LaunchSummary {
     Write-Host ("[cc-switch] mode={0} provider={1} model={2} reasoning={3}" -f $LaunchMode, $provider, $model, $effort)
 }
 
-function Write-PersistenceFailure {
+function Write-PersistenceEvent {
     param(
+        [Parameter(Mandatory = $true)][string]$Level,
+        [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$RunHome,
-        [Parameter(Mandatory = $true)][string]$Reason
+        [Parameter(Mandatory = $true)][string]$Status,
+        [AllowNull()][string]$ErrorCode,
+        [AllowNull()][object]$ExitCode,
+        [AllowNull()][string]$Message
     )
 
-    $warningText = "Model persistence failed for run '$RunHome' ($Reason)."
-    Write-Warning $warningText
     try {
         $logDirectory = Split-Path -Parent $PersistenceLog
         [IO.Directory]::CreateDirectory($logDirectory) | Out-Null
-        $logLine = "[{0}] WARN {1}" -f (Get-Date).ToString('o'), $warningText
+        $record = [ordered]@{
+            timestamp = (Get-Date).ToString('o')
+            level = $Level
+            source = $Source
+            run = Split-Path -Leaf $RunHome
+            status = $Status
+            errorCode = if ([string]::IsNullOrWhiteSpace($ErrorCode)) { $null } else { Get-SafeConsoleText $ErrorCode }
+            exitCode = $ExitCode
+            message = if ([string]::IsNullOrWhiteSpace($Message)) { $null } else { Get-SafeConsoleText $Message }
+        }
+        $logLine = $record | ConvertTo-Json -Depth 4 -Compress
         [IO.File]::AppendAllText($PersistenceLog, $logLine + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     } catch [System.IO.IOException] {
         Write-Warning "Could not write persistence failure log: $PersistenceLog"
@@ -451,15 +534,53 @@ function Write-PersistenceFailure {
     }
 }
 
+function Write-PersistenceFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$RunHome,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [AllowNull()][string]$ErrorCode = $null,
+        [AllowNull()][object]$ExitCode = $null
+    )
+
+    $warningText = "Model persistence failed ($Reason) for run '$RunHome'."
+    Write-Warning $warningText
+    Write-PersistenceEvent -Level 'error' -Source $Source -RunHome $RunHome -Status 'failed' `
+        -ErrorCode $ErrorCode -ExitCode $ExitCode -Message $warningText
+}
+
+function Find-PersistenceResult {
+    param([AllowEmptyCollection()][object[]]$Output)
+
+    for ($index = $Output.Count - 1; $index -ge 0; $index--) {
+        $text = [string]$Output[$index]
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        try {
+            $candidate = $text | ConvertFrom-Json -ErrorAction Stop
+            if ($candidate.PSObject.Properties.Name -contains 'ok') {
+                return $candidate
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
 function Invoke-RunModelPersistence {
     param(
         [Parameter(Mandatory = $true)][string]$RunHome,
-        [Parameter(Mandatory = $true)][long]$ExitOrder
+        [Parameter(Mandatory = $true)][long]$ExitOrder,
+        [Parameter(Mandatory = $true)][string]$CcSwitchRoot,
+        [string]$Source = 'final',
+        [string[]]$ChangedFields = @()
     )
 
     if (-not (Test-Path -LiteralPath $PersistScript -PathType Leaf)) {
-        Write-PersistenceFailure -RunHome $RunHome -Reason 'persist script is missing'
-        return
+        Write-PersistenceFailure -RunHome $RunHome -Source $Source -Reason 'persist script is missing' `
+            -ErrorCode 'persist_script_missing'
+        return $false
     }
 
     try {
@@ -471,17 +592,228 @@ function Invoke-RunModelPersistence {
         if (-not (Test-Path -LiteralPath $powerShellExecutable -PathType Leaf)) {
             throw "Current PowerShell executable was not found: $powerShellExecutable"
         }
-        & $powerShellExecutable -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-            -File $PersistScript -RunHome $RunHome -ExitOrder $ExitOrder `
-            -AllowedRunHomesRoot $RunHomesRoot -Json *> $null
-        $persistenceExitCode = Get-LastExitCode
-        if ($persistenceExitCode -notin @($null, 0)) {
-            Write-PersistenceFailure -RunHome $RunHome -Reason "exit code $persistenceExitCode"
+        $arguments = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $PersistScript,
+            '-RunHome', $RunHome,
+            '-ExitOrder', ([string]$ExitOrder),
+            '-CcSwitchRoot', $CcSwitchRoot,
+            '-AllowedRunHomesRoot', $RunHomesRoot,
+            '-Json'
+        )
+        if ($ChangedFields.Count -gt 0) {
+            $arguments += @('-ChangedFieldsCsv', ($ChangedFields -join ','))
         }
+
+        $previousPreference = $ErrorActionPreference
+        $global:LASTEXITCODE = 0
+        try {
+            $ErrorActionPreference = 'Continue'
+            $output = @(& $powerShellExecutable @arguments 2>&1)
+            $persistenceExitCode = Get-LastExitCode
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        $result = Find-PersistenceResult -Output $output
+        if ($null -ne $result -and [bool]$result.ok -and
+            $persistenceExitCode -in @($null, 0)) {
+            Write-PersistenceEvent -Level 'info' -Source $Source -RunHome $RunHome `
+                -Status ([string]$result.status) -ErrorCode $null -ExitCode 0 `
+                -Message ([string]$result.message)
+            return $true
+        }
+
+        $errorCode = if ($null -ne $result) { [string]$result.errorCode } else { 'missing_result' }
+        $message = if ($null -ne $result) { [string]$result.message } else { 'Persistence returned no JSON result.' }
+        Write-PersistenceFailure -RunHome $RunHome -Source $Source `
+            -Reason $message -ErrorCode $errorCode -ExitCode $persistenceExitCode
+        return $false
     } catch {
         $exceptionType = $_.Exception.GetType().Name
         $exceptionMessage = Get-SafeConsoleText -Text $_.Exception.Message
-        Write-PersistenceFailure -RunHome $RunHome -Reason ("{0}: {1}" -f $exceptionType, $exceptionMessage)
+        Write-PersistenceFailure -RunHome $RunHome -Source $Source `
+            -Reason ("{0}: {1}" -f $exceptionType, $exceptionMessage) `
+            -ErrorCode 'launcher_exception'
+        return $false
+    }
+}
+
+function Get-RunModelStatePath {
+    param([Parameter(Mandatory = $true)][string]$RunHome)
+
+    return Join-Path $RunHome '.ccswitch-model-persist-state.json'
+}
+
+function Get-PendingChangedFields {
+    param([Parameter(Mandatory = $true)][string]$StateFile)
+
+    if (-not (Test-Path -LiteralPath $StateFile -PathType Leaf)) {
+        return @()
+    }
+    try {
+        $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+        if ($state.schemaVersion -ne 1) {
+            throw 'Unsupported watcher state schema.'
+        }
+        $fields = @($state.pendingFields)
+        foreach ($field in $fields) {
+            if ([string]$field -notin @('model', 'model_reasoning_effort')) {
+                throw 'Watcher state contains an unsupported changed field.'
+            }
+        }
+        return [string[]]$fields
+    } catch {
+        Write-PersistenceFailure -RunHome (Split-Path -Parent $StateFile) -Source 'final' `
+            -Reason 'watcher state is invalid' -ErrorCode 'invalid_watcher_state'
+        return @()
+    }
+}
+
+function Get-LauncherPowerShellExecutable {
+    $name = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' }
+    $path = Join-Path $PSHOME $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Current PowerShell executable was not found: $path"
+    }
+    return [IO.Path]::GetFullPath($path)
+}
+
+function Start-RunModelWatcher {
+    param(
+        [Parameter(Mandatory = $true)][string]$RunHome,
+        [Parameter(Mandatory = $true)][string]$CcSwitchRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $RunModelWatcherScript -PathType Leaf)) {
+        Write-PersistenceFailure -RunHome $RunHome -Source 'watcher' `
+            -Reason 'watcher script is missing' -ErrorCode 'watcher_script_missing'
+        return $null
+    }
+
+    $stopFile = Join-Path $RunHome ('.ccswitch-model-watch-stop-{0}-{1}.signal' -f `
+        $PID, [guid]::NewGuid().ToString('N'))
+    $readyFile = Join-Path $RunHome ('.ccswitch-model-watch-ready-{0}-{1}.signal' -f `
+        $PID, [guid]::NewGuid().ToString('N'))
+    $stateFile = Get-RunModelStatePath -RunHome $RunHome
+    try {
+        $parentStartTime = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().Ticks
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = Get-LauncherPowerShellExecutable
+        $startInfo.WorkingDirectory = $UserRoot
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        foreach ($argument in @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $RunModelWatcherScript,
+            '-RunHome', $RunHome,
+            '-CcSwitchRoot', $CcSwitchRoot,
+            '-AllowedRunHomesRoot', $RunHomesRoot,
+            '-ParentProcessId', ([string]$PID),
+            '-ParentProcessStartTimeUtcTicks', ([string]$parentStartTime),
+            '-StopFile', $stopFile,
+            '-StateFile', $stateFile,
+            '-ReadyFile', $readyFile,
+            '-PersistenceLog', $PersistenceLog,
+            '-PersistScript', $PersistScript
+        )) {
+            $null = $startInfo.ArgumentList.Add([string]$argument)
+        }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            $process.Dispose()
+            throw 'The model watcher process did not start.'
+        }
+        $ready = $false
+        for ($attempt = 0; $attempt -lt 40; $attempt++) {
+            if (Test-Path -LiteralPath $readyFile -PathType Leaf) {
+                $ready = $true
+                break
+            }
+            if ($process.HasExited) {
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $ready) {
+            if (-not $process.HasExited) {
+                $process.Kill($true)
+                $null = $process.WaitForExit(2000)
+            }
+            $process.Dispose()
+            throw 'The model watcher did not become ready.'
+        }
+        return [pscustomobject]@{
+            Process = $process
+            StopFile = $stopFile
+            ReadyFile = $readyFile
+            StateFile = $stateFile
+        }
+    } catch {
+        Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue
+        Write-PersistenceFailure -RunHome $RunHome -Source 'watcher' `
+            -Reason $_.Exception.Message -ErrorCode 'watcher_start_failed'
+        return $null
+    }
+}
+
+function Stop-RunModelWatcher {
+    param([AllowNull()]$Watcher)
+
+    if ($null -eq $Watcher) {
+        return
+    }
+    try {
+        if (-not $Watcher.Process.HasExited) {
+            [IO.File]::WriteAllText([string]$Watcher.StopFile, 'stop', [Text.UTF8Encoding]::new($false))
+            if (-not $Watcher.Process.WaitForExit(5000)) {
+                $Watcher.Process.Kill($true)
+                $null = $Watcher.Process.WaitForExit(2000)
+            }
+        }
+    } catch {
+        Write-PersistenceFailure -RunHome (Split-Path -Parent ([string]$Watcher.StateFile)) `
+            -Source 'watcher' -Reason $_.Exception.Message -ErrorCode 'watcher_stop_failed'
+    } finally {
+        $Watcher.Process.Dispose()
+        Remove-Item -LiteralPath ([string]$Watcher.StopFile) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath ([string]$Watcher.ReadyFile) -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-SnapshotCcSwitchRoot {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [AllowNull()][string]$FallbackRoot
+    )
+
+    if ($Snapshot.PSObject.Properties['ccSwitchRoot'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Snapshot.ccSwitchRoot)) {
+        try {
+            $snapshotRoot = [string]$Snapshot.ccSwitchRoot
+            if ($snapshotRoot -match '^(?:[A-Za-z]:[\\/]|\\\\)') {
+                return [IO.Path]::GetFullPath($snapshotRoot)
+            }
+        } catch [ArgumentException] {
+        } catch [NotSupportedException] {
+        } catch [System.Security.SecurityException] {
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($FallbackRoot)) {
+        return $null
+    }
+    try {
+        if ($FallbackRoot -match '^(?:[A-Za-z]:[\\/]|\\\\)') {
+            return [IO.Path]::GetFullPath($FallbackRoot)
+        }
+        return $null
+    } catch [ArgumentException] {
+        return $null
+    } catch [NotSupportedException] {
+        return $null
+    } catch [System.Security.SecurityException] {
+        return $null
     }
 }
 
@@ -499,15 +831,60 @@ function Restore-ProcessEnvironment {
     param([Parameter(Mandatory = $true)][hashtable]$Snapshot)
 
     foreach ($name in $Snapshot.Keys) {
-        [Environment]::SetEnvironmentVariable($name, $Snapshot[$name], 'Process')
+        if ($null -eq $Snapshot[$name]) {
+            Remove-ProcessEnvironmentVariable -Name $name
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $Snapshot[$name], 'Process')
+        }
     }
 }
 
-$launchEnvironment = Get-ProcessEnvironmentSnapshot -Names $LaunchEnvironmentNames
+function Remove-ProcessEnvironmentVariable {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $path = "Env:$Name"
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+    }
+}
+
+function Get-LaunchEnvironmentNames {
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $StaticLaunchEnvironmentNames) {
+        $null = $names.Add($name)
+    }
+    foreach ($name in [Environment]::GetEnvironmentVariables('Process').Keys) {
+        if ([string]$name -like 'OPENAI_*') {
+            $null = $names.Add([string]$name)
+        }
+    }
+    return [string[]]@($names | ForEach-Object { [string]$_ })
+}
+
+function Clear-ProcessEnvironment {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Names)
+
+    foreach ($name in $Names) {
+        Remove-ProcessEnvironmentVariable -Name $name
+    }
+}
+
+function Clear-OpenAiProcessEnvironment {
+    foreach ($name in [Environment]::GetEnvironmentVariables('Process').Keys) {
+        if ([string]$name -like 'OPENAI_*') {
+            Remove-ProcessEnvironmentVariable -Name ([string]$name)
+        }
+    }
+}
+
+$launchEnvironmentNames = @(Get-LaunchEnvironmentNames)
+$launchEnvironment = Get-ProcessEnvironmentSnapshot -Names $launchEnvironmentNames
 $materializedSnapshot = $null
 $codexExitCode = 1
 $launchOutcomeHandled = $false
 $exitOrder = [long]0
+$runModelWatcher = $null
+$persistenceRoot = $null
 
 try {
     Disable-CodexFocusReporting
@@ -520,13 +897,17 @@ try {
         $codexExitCode = if ($null -eq $lastExitCode) { 0 } else { [int]$lastExitCode }
         $launchOutcomeHandled = $true
     } else {
+        if (Test-CodexUpdateNoticeRequest -Arguments $CodexArguments) {
+            Write-CodexUpdateNotice
+        }
         $env:PRODEX_CODEX_BIN = $focusFixedCodexBin
         # Materialization belongs to the user-level Prodex root, not an inherited run-scoped home.
         $env:PRODEX_HOME = $ProdexRoot
 
         $historicalSessionRequest = Get-HistoricalSessionRequest -Arguments $CodexArguments
         $materializedSnapshot = if ($null -eq $historicalSessionRequest) {
-            Get-MaterializedSnapshot -LaunchMode $launchMode
+            $ActiveCcSwitchRoot = Resolve-CcSwitchRoot -UserRoot $UserRoot -AppDataRoot $env:APPDATA
+            Get-MaterializedSnapshot -LaunchMode $launchMode -CcSwitchRoot $ActiveCcSwitchRoot
         } elseif ($null -ne $historicalSessionRequest.sessionId -or
             [bool]$historicalSessionRequest.useLatest -or
             [bool]$historicalSessionRequest.diagnostic) {
@@ -540,15 +921,32 @@ try {
             $selectedSession.snapshot
         }
         Write-LaunchSummary -Snapshot $materializedSnapshot -LaunchMode $launchMode
+        $persistenceRoot = Get-SnapshotCcSwitchRoot `
+            -Snapshot $materializedSnapshot -FallbackRoot $ActiveCcSwitchRoot
+        if (-not [string]::IsNullOrWhiteSpace([string]$persistenceRoot)) {
+            $runModelWatcher = Start-RunModelWatcher `
+                -RunHome ([string]$materializedSnapshot.codexHome) `
+                -CcSwitchRoot $persistenceRoot
+        }
+
         $launchArguments = @(Get-CodexLaunchArguments -Arguments $CodexArguments)
         $launchArguments = @(Add-TrustedWorkspaceOverride -Arguments $launchArguments)
+        $explicitSandboxRequested = Test-CodexExplicitSandboxRequest -Arguments $launchArguments
+        $bypassRequested = Test-CodexBypassRequest -Arguments $launchArguments
+        if ($explicitSandboxRequested -and $bypassRequested) {
+            throw 'Conflicting Codex safety options: an explicit sandbox cannot be combined with --dangerously-bypass-approvals-and-sandbox.'
+        }
         $global:LASTEXITCODE = 0
+        Clear-OpenAiProcessEnvironment
+        Remove-ProcessEnvironmentVariable -Name 'CODEX_HOME'
         if ($launchMode -eq 'direct') {
             $env:CODEX_HOME = [string]$materializedSnapshot.codexHome
-            foreach ($name in @('PRODEX_CODEX_BIN', 'PRODEX_HOME', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_BASE')) {
-                [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+            Clear-ProcessEnvironment -Names @('PRODEX_CODEX_BIN', 'PRODEX_HOME')
+            if ($explicitSandboxRequested -or $bypassRequested) {
+                & $focusFixedCodexBin @launchArguments
+            } else {
+                & $focusFixedCodexBin --dangerously-bypass-approvals-and-sandbox @launchArguments
             }
-            & $focusFixedCodexBin --dangerously-bypass-approvals-and-sandbox @launchArguments
         } else {
             $prodexLauncher = Get-ProdexLauncher
             $env:PRODEX_HOME = [string]$materializedSnapshot.prodexHome
@@ -556,8 +954,12 @@ try {
             try {
                 # Prodex emits update notices on stderr; the run outcome is governed by its exit code.
                 $ErrorActionPreference = 'Continue'
-                & $prodexLauncher run --profile ([string]$materializedSnapshot.profileName) `
-                    --no-auto-rotate --full-access @launchArguments
+                $prodexArguments = @('run', '--profile', [string]$materializedSnapshot.profileName, '--no-auto-rotate')
+                if (-not $explicitSandboxRequested -and -not $bypassRequested) {
+                    $prodexArguments += '--full-access'
+                }
+                $prodexArguments += $launchArguments
+                & $prodexLauncher @prodexArguments
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
             }
@@ -582,12 +984,37 @@ try {
     $codexExitCode = 1
     $launchOutcomeHandled = $true
 } finally {
+    Stop-RunModelWatcher -Watcher $runModelWatcher
     Restore-ProcessEnvironment -Snapshot $launchEnvironment
     if ($null -ne $materializedSnapshot) {
         if ($exitOrder -le 0) {
             $exitOrder = [DateTime]::UtcNow.Ticks
         }
-        Invoke-RunModelPersistence -RunHome ([string]$materializedSnapshot.codexHome) -ExitOrder $exitOrder
+        if ([string]::IsNullOrWhiteSpace([string]$persistenceRoot)) {
+            $persistenceRoot = Get-SnapshotCcSwitchRoot `
+                -Snapshot $materializedSnapshot -FallbackRoot $ActiveCcSwitchRoot
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$persistenceRoot)) {
+            Write-PersistenceFailure -RunHome ([string]$materializedSnapshot.codexHome) `
+                -Source 'final' -Reason 'provider data root is missing or invalid' `
+                -ErrorCode 'invalid_provider_root'
+        } else {
+            $stateFile = Get-RunModelStatePath -RunHome ([string]$materializedSnapshot.codexHome)
+            $pendingFields = @(Get-PendingChangedFields -StateFile $stateFile)
+            $persistenceArguments = @{
+                RunHome = [string]$materializedSnapshot.codexHome
+                ExitOrder = $exitOrder
+                CcSwitchRoot = $persistenceRoot
+                Source = 'final'
+            }
+            if ($pendingFields.Count -gt 0) {
+                $persistenceArguments.ChangedFields = [string[]]$pendingFields
+            }
+            $persistenceSucceeded = Invoke-RunModelPersistence @persistenceArguments
+            if ($persistenceSucceeded) {
+                Remove-Item -LiteralPath $stateFile -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     Disable-CodexFocusReporting
     if (-not $launchOutcomeHandled) {

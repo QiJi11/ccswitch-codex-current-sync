@@ -18,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $UserRoot = [Environment]::GetFolderPath('UserProfile')
+$DesktopCcSwitchRoot = Join-Path $env:APPDATA 'com.ccswitch.desktop'
 $LegacyCcSwitchRoot = Join-Path $UserRoot '.cc-switch'
 $ExplicitCcSwitchRoot = -not [string]::IsNullOrWhiteSpace($CcSwitchRoot)
 $DbPath = $null
@@ -42,9 +43,11 @@ function Get-CandidateCcSwitchRoots {
     if ($ExplicitCcSwitchRoot) {
         $candidates.Add((Get-FullPathIfPossible -Path $CcSwitchRoot)) | Out-Null
     } else {
-        $full = Get-FullPathIfPossible -Path $LegacyCcSwitchRoot
-        if ($candidates -notcontains $full) {
-            $candidates.Add($full) | Out-Null
+        foreach ($root in @($DesktopCcSwitchRoot, $LegacyCcSwitchRoot)) {
+            $full = Get-FullPathIfPossible -Path $root
+            if ($candidates -notcontains $full) {
+                $candidates.Add($full) | Out-Null
+            }
         }
     }
 
@@ -60,7 +63,7 @@ function Set-ActiveCcSwitchRoot {
     $script:BackupDir = Join-Path $script:CcSwitchRoot 'backups'
 }
 
-Set-ActiveCcSwitchRoot -Root ($(if ($ExplicitCcSwitchRoot) { $CcSwitchRoot } else { $LegacyCcSwitchRoot }))
+Set-ActiveCcSwitchRoot -Root ($(if ($ExplicitCcSwitchRoot) { $CcSwitchRoot } else { $DesktopCcSwitchRoot }))
 
 function Write-SwitchInfo {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -455,7 +458,7 @@ function Resolve-ProviderForRequest {
 }
 
 function Sync-MirrorRootCurrentProvider {
-    param([Parameter(Mandatory = $true)][string]$ProviderId)
+    param([Parameter(Mandatory = $true)][string]$ProviderName)
 
     $primaryRoot = $CcSwitchRoot
     $results = New-Object System.Collections.Generic.List[object]
@@ -478,32 +481,25 @@ function Sync-MirrorRootCurrentProvider {
                 continue
             }
 
-            $state = Get-DbState
-            $matching = @($state.providers | Where-Object { [string]$_.id -eq $ProviderId })
-            if ($matching.Count -ne 1) {
-                $results.Add([pscustomobject]@{
-                    root    = $CcSwitchRoot
-                    status  = 'skipped'
-                    message = 'provider id not present'
-                }) | Out-Null
-                continue
-            }
+            $mirrorProvider = (Resolve-Provider -ProviderText $ProviderName).provider
 
-            if (Test-DbSettingsConsistent -ProviderDetails $matching[0]) {
+            if (Test-DbSettingsConsistent -ProviderDetails $mirrorProvider) {
                 $results.Add([pscustomobject]@{
-                    root    = $CcSwitchRoot
-                    status  = 'unchanged'
-                    message = 'already selected'
+                    root       = $CcSwitchRoot
+                    providerId = [string]$mirrorProvider.id
+                    status     = 'unchanged'
+                    message    = 'already selected'
                 }) | Out-Null
                 continue
             }
 
             $dbBackupPath = New-UniqueBackupPath -Directory $BackupDir -Leaf "cc-switch.db.bak-mirror-$stamp"
             $settingsBackupPath = New-UniqueBackupPath -Directory $BackupDir -Leaf "settings.json.bak-mirror-$stamp"
-            Set-DbCurrentProvider -ProviderId $ProviderId -BackupPath $dbBackupPath | Out-Null
-            Set-SettingsCurrentProvider -ProviderId $ProviderId -BackupPath $settingsBackupPath
+            Set-DbCurrentProvider -ProviderId ([string]$mirrorProvider.id) -BackupPath $dbBackupPath | Out-Null
+            Set-SettingsCurrentProvider -ProviderId ([string]$mirrorProvider.id) -BackupPath $settingsBackupPath
             $results.Add([pscustomobject]@{
                 root               = $CcSwitchRoot
+                providerId         = [string]$mirrorProvider.id
                 status             = 'updated'
                 message            = 'mirrored current provider'
                 dbBackupPath       = $dbBackupPath
@@ -708,7 +704,7 @@ try {
         Write-SwitchInfo ("selected provider={0} id={1} root={2}" -f $target.name, $target.id, $CcSwitchRoot)
     }
 
-    $result.mirrors = @(Sync-MirrorRootCurrentProvider -ProviderId ([string]$target.id))
+    $result.mirrors = @(Sync-MirrorRootCurrentProvider -ProviderName ([string]$target.name))
 
     $materialize = Invoke-Materialize
     $result.materializedProfile = [string]$materialize.Metadata.profileName

@@ -2,6 +2,7 @@
 
 ## 仓库已实现
 
+- [x] 将模型、model_fast、reasoning effort、service tier 和 Fast mode 统一同步到全局 Codex 配置及全部 CC Switch Codex provider；同步带 SQLite/config 备份、互斥锁、模型目录校验和事务失败关闭。
 - [x] 每次常规交互或 `exec` 启动创建独立 `ccswitch-runs\ccswitch-run-*` Codex home 和持久化兼容目录 `<run home>\.prodex-runtime`，UI 后续切换不重写正在使用的快照；四个单参数根级诊断请求不创建 run home。
 - [x] 一致读取 `settings.json` 与 SQLite provider 状态；无法取得一致快照时停止启动。
 - [x] 原子发布 run home；默认 direct 设置独立 `CODEX_HOME` 并直接启动 focus-fixed Codex，不注册 Prodex profile；`CCSWITCH_CODEX_LAUNCH_MODE=prodex` 保留原私有 runtime 回滚，不读取或改写全局 `~\.prodex\state.json`。
@@ -44,6 +45,7 @@
 - [x] 新增 preview-first retention 工具与 fixture matrix：默认 30 天、仅 `-Apply` 删除直属且无 session、历史、state database、reparse point 或活跃引用的普通目录；枚举或稳定 File ID 核验失败时停止。2026-07-12 修复后的真实 Preview 检查 244 个 run home：53 个含 session/rollout、38 个含 history、58 个含 state database、7 个有活跃引用，0 eligible、0 删除。
 - [x] 新增只读 provider 配置迁移检查器与真实 SQLite fixture；2026-07-12 Preview 检查 27 个 Codex provider，8 个受影响（7 个旧审批键、5 个 removed `js_repl`），数据库、settings 和 live config 均未写入。
 - [ ] 等 CC Switch 自然关闭后，通过应用 UI 迁移上述 provider 源配置；运行期间不直接写 SQLite，也不覆盖当前 live config。
+- [x] 2026-07-15 验证 Codex App Fast 的 ChatGPT 门控与自定义 provider 鉴权冲突；新增只监听 loopback 的鉴权替换代理、登录态/endpoint 一致性校验、启动安装器、全局混合配置启用器和隔离回归测试。
 
 ## 不在范围
 

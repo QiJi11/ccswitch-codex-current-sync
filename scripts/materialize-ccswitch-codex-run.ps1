@@ -11,6 +11,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve-ccswitch-root.ps1')
 
 $UserRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     [Environment]::GetFolderPath('UserProfile')
@@ -21,11 +22,7 @@ if ([string]::IsNullOrWhiteSpace($UserRoot)) {
     throw 'Unable to resolve the user profile directory.'
 }
 
-if ([string]::IsNullOrWhiteSpace($CcSwitchRoot)) {
-    $CcSwitchRoot = Join-Path $UserRoot '.cc-switch'
-} else {
-    $CcSwitchRoot = [System.IO.Path]::GetFullPath($CcSwitchRoot)
-}
+$CcSwitchRoot = Resolve-CcSwitchRoot -ExplicitRoot $CcSwitchRoot -UserRoot $UserRoot -AppDataRoot $env:APPDATA
 $ProdexRoot = if ([string]::IsNullOrWhiteSpace($env:PRODEX_HOME)) {
     Join-Path $UserRoot '.prodex'
 } else {
@@ -45,8 +42,11 @@ if ([string]::IsNullOrWhiteSpace($ProdexScript)) {
 }
 $RunHomesRoot = Join-Path $ProdexRoot 'manual-homes\ccswitch-runs'
 $CurrentHome = Join-Path $ProdexRoot 'manual-homes\ccswitch-current'
+$CurrentAgentsRoot = Join-Path $CurrentHome 'agents'
 $CurrentSkillsRoot = Join-Path $CurrentHome 'skills'
 $GlobalSkillsRoot = Join-Path $GlobalCodexRoot 'skills'
+$GlobalConfigPath = Join-Path $GlobalCodexRoot 'config.toml'
+$GlobalHooksPath = Join-Path $GlobalCodexRoot 'hooks.json'
 
 function ConvertTo-SafeName {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -351,11 +351,26 @@ function Add-SkillEntry {
 }
 
 function Initialize-CodexHomeRulesAndSkills {
-    param([Parameter(Mandatory = $true)][string]$CodexHomePath)
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexHomePath,
+        [Parameter(Mandatory = $true)][byte[]]$HooksConfigBytes
+    )
 
     $agentsSource = Join-Path $CurrentHome 'AGENTS.md'
     if (-not (Test-Path -LiteralPath $agentsSource)) { throw "Missing current AGENTS.md: $agentsSource" }
     Copy-Item -LiteralPath $agentsSource -Destination (Join-Path $CodexHomePath 'AGENTS.md') -Force
+
+    [IO.File]::WriteAllBytes((Join-Path $CodexHomePath 'hooks.json'), $HooksConfigBytes)
+
+    $reviewerAgentsTarget = Join-Path $CodexHomePath 'agents'
+    New-Item -ItemType Directory -Path $reviewerAgentsTarget -Force | Out-Null
+    foreach ($reviewerAgent in @('skeptic-reviewer.toml', 'verifier.toml')) {
+        $reviewerAgentSource = Join-Path $CurrentAgentsRoot $reviewerAgent
+        if (-not (Test-Path -LiteralPath $reviewerAgentSource -PathType Leaf)) {
+            throw "Missing current reviewer agent: $reviewerAgentSource"
+        }
+        Copy-Item -LiteralPath $reviewerAgentSource -Destination (Join-Path $reviewerAgentsTarget $reviewerAgent) -Force
+    }
 
     $skillsTarget = Join-Path $CodexHomePath 'skills'
     New-Item -ItemType Directory -Path $skillsTarget -Force | Out-Null
@@ -368,7 +383,7 @@ function Initialize-CodexHomeRulesAndSkills {
         }
     }
 
-    foreach ($skill in @('accuracy-gate', 'prompt-sensei', 'clean-code-guard', 'docs-guard', 'test-guard', 'pict-test-designer')) {
+    foreach ($skill in @('accuracy-gate', 'antigravity-collaborator', 'prompt-sensei', 'clean-code-guard', 'docs-guard', 'test-guard', 'pict-test-designer', 'multi-agent-review')) {
         Add-SkillEntry -TargetRoot $skillsTarget -Name $skill -SourceRoot $GlobalSkillsRoot
     }
 }
@@ -421,6 +436,7 @@ function Test-StagedCodexHome {
     $pythonCode = @'
 import hashlib
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -443,6 +459,7 @@ try:
     parsed_config = tomllib.loads(config_text)
     auth = json.loads((root / "auth.json").read_text(encoding="utf-8"))
     metadata = json.loads((root / "run-provider.json").read_text(encoding="utf-8"))
+    hooks_document = json.loads((root / "hooks.json").read_text(encoding="utf-8"))
 
     if not isinstance(auth, dict):
         raise RuntimeError("auth.json must contain a JSON object.")
@@ -464,8 +481,54 @@ try:
         raise RuntimeError("run-provider.json model does not match config.toml.")
     if metadata.get("modelReasoningEffort") != parsed_config.get("model_reasoning_effort"):
         raise RuntimeError("run-provider.json modelReasoningEffort does not match config.toml.")
-    if not (root / "AGENTS.md").is_file() or not (root / "skills").is_dir():
+    configured_mcp_names = sorted(parsed_config.get("mcp_servers", {}).keys())
+    if metadata.get("mcpServerNames") != configured_mcp_names:
+        raise RuntimeError("run-provider.json mcpServerNames does not match config.toml.")
+    event_key_map = {
+        "SessionStart": "session_start",
+        "UserPromptSubmit": "user_prompt_submit",
+        "Stop": "stop",
+        "PreCompact": "pre_compact",
+    }
+    hook_states = parsed_config.get("hooks", {}).get("state", {})
+    expected_hook_trust = metadata.get("hookTrustByKey")
+    if not isinstance(expected_hook_trust, dict):
+        raise RuntimeError("run-provider.json hookTrustByKey must be an object.")
+    for event_name, matcher_groups in hooks_document.get("hooks", {}).items():
+        if event_name not in event_key_map:
+            continue
+        for group_index, matcher_group in enumerate(matcher_groups):
+            for hook_index, hook in enumerate(matcher_group.get("hooks", [])):
+                if hook.get("type") != "command":
+                    continue
+                hook_key = f"{event_key_map[event_name]}:{group_index}:{hook_index}"
+                state_key = f"{(final_home / 'hooks.json').resolve()}:{hook_key}"
+                trusted_hash = hook_states.get(state_key, {}).get("trusted_hash")
+                if trusted_hash != expected_hook_trust.get(hook_key):
+                    raise RuntimeError(f"Run-local hook trust does not match its global source for {hook_key}.")
+                if not re.fullmatch(r"sha256:[0-9A-Fa-f]{64}", trusted_hash):
+                    raise RuntimeError(f"Invalid run-local hook trust for {hook_key}.")
+    if not (root / "AGENTS.md").is_file() or not (root / "hooks.json").is_file() or not (root / "skills").is_dir():
         raise RuntimeError("The staged Codex home is missing AGENTS.md or skills.")
+    if not (root / "skills" / "multi-agent-review" / "SKILL.md").is_file():
+        raise RuntimeError("The staged Codex home is missing multi-agent-review.")
+    for reviewer_name in ("skeptic-reviewer", "verifier"):
+        reviewer_path = root / "agents" / f"{reviewer_name}.toml"
+        reviewer_config = tomllib.loads(reviewer_path.read_text(encoding="utf-8"))
+        if reviewer_config.get("sandbox_mode") != "read-only":
+            raise RuntimeError(f"{reviewer_name} must request a read-only sandbox.")
+        if reviewer_config.get("model_reasoning_effort") != "high":
+            raise RuntimeError(f"{reviewer_name} must use high reasoning effort.")
+        reviewer_instructions = reviewer_config.get("developer_instructions", "")
+        if "read-only sandbox setting as a request" not in reviewer_instructions:
+            raise RuntimeError(f"{reviewer_name} must document that the runtime may not enforce the sandbox request.")
+        required_reviewer_prohibitions = (
+            "Do not edit files or change external state.",
+            "Do not commit, create or switch branches, modify refs, add labels/comments, or send external messages.",
+            "Do not spawn subagents.",
+        )
+        if any(fragment not in reviewer_instructions for fragment in required_reviewer_prohibitions):
+            raise RuntimeError(f"{reviewer_name} must include the complete no-write reviewer contract.")
 except Exception as exc:
     print(json.dumps({"ok": False, "message": str(exc)}, ensure_ascii=True))
 else:
@@ -486,6 +549,324 @@ else:
     }
 }
 
+function Get-ShortSha256Text {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($Text)
+        $digest = $sha256.ComputeHash($bytes)
+    } finally {
+        $sha256.Dispose()
+    }
+    return ([System.BitConverter]::ToString($digest) -replace '-', '').ToLowerInvariant().Substring(0, 16)
+}
+
+function Get-ConfiguredHookKeys {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HooksConfigText
+    )
+
+    $hooksDocument = $HooksConfigText | ConvertFrom-Json
+    if ($null -eq $hooksDocument.hooks) {
+        throw "Hooks configuration has no 'hooks' object."
+    }
+
+    $eventKeyMap = @{
+        SessionStart = 'session_start'
+        UserPromptSubmit = 'user_prompt_submit'
+        Stop = 'stop'
+        PreCompact = 'pre_compact'
+    }
+    $hookKeys = [Collections.Generic.List[string]]::new()
+    foreach ($eventProperty in $hooksDocument.hooks.PSObject.Properties) {
+        if (-not $eventKeyMap.ContainsKey($eventProperty.Name)) {
+            continue
+        }
+
+        $eventKey = $eventKeyMap[$eventProperty.Name]
+        $matcherGroups = @($eventProperty.Value)
+        for ($groupIndex = 0; $groupIndex -lt $matcherGroups.Count; $groupIndex++) {
+            $groupHooks = @($matcherGroups[$groupIndex].hooks)
+            for ($hookIndex = 0; $hookIndex -lt $groupHooks.Count; $hookIndex++) {
+                if ([string]$groupHooks[$hookIndex].type -eq 'command') {
+                    $hookKeys.Add(("{0}:{1}:{2}" -f $eventKey, $groupIndex, $hookIndex))
+                }
+            }
+        }
+    }
+
+    return @($hookKeys)
+}
+
+function Get-TrustedHookHashMap {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigText,
+        [Parameter(Mandatory = $true)][string]$SourceHookPath,
+        [Parameter(Mandatory = $true)][string[]]$HookKeys
+    )
+
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $pythonCode = @'
+import json
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+config = tomllib.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+source_path = str(Path(sys.argv[2]).resolve())
+hook_keys = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+states = config.get("hooks", {}).get("state", {})
+if not isinstance(states, dict):
+    raise RuntimeError("Global hooks.state must be a TOML table.")
+
+folded_states = {}
+for state_key, state_value in states.items():
+    folded_key = str(state_key).casefold()
+    if folded_key in folded_states and folded_states[folded_key] != state_value:
+        raise RuntimeError("Global hook trust contains conflicting case variants.")
+    folded_states[folded_key] = state_value
+
+hashes = {}
+for hook_key in hook_keys:
+    state_key = f"{source_path}:{hook_key}".casefold()
+    state = folded_states.get(state_key)
+    trusted_hash = state.get("trusted_hash") if isinstance(state, dict) else None
+    if not isinstance(trusted_hash, str) or not re.fullmatch(
+        r"sha256:[0-9A-Fa-f]{64}", trusted_hash
+    ):
+        raise RuntimeError(f"Missing valid global hook trust for {hook_key}.")
+    hashes[hook_key] = trusted_hash
+
+print(json.dumps({"ok": True, "hashes": hashes}, ensure_ascii=True))
+'@
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $suffix = "$PID-$([guid]::NewGuid().ToString('N'))"
+    $tempPythonPath = Join-Path $tempRoot "ccswitch-hook-trust-$suffix.py"
+    $tempConfigPath = Join-Path $tempRoot "ccswitch-hook-trust-$suffix.toml"
+    $tempKeysPath = Join-Path $tempRoot "ccswitch-hook-trust-$suffix.json"
+    try {
+        Write-Utf8NoBom -Path $tempPythonPath -Content $pythonCode
+        Write-Utf8NoBom -Path $tempConfigPath -Content $ConfigText
+        Write-Utf8NoBom -Path $tempKeysPath -Content (($HookKeys | ConvertTo-Json -Compress) + "`n")
+        $output = & $python $tempPythonPath $tempConfigPath $SourceHookPath $tempKeysPath
+        if ($LASTEXITCODE -ne 0) { throw "Global hook trust parsing failed with exit code $LASTEXITCODE." }
+        $result = (($output | Out-String).Trim() | ConvertFrom-Json)
+        if (-not [bool]$result.ok) { throw 'Global hook trust parsing failed.' }
+        $hashMap = @{}
+        foreach ($property in $result.hashes.PSObject.Properties) {
+            $hashMap[$property.Name] = [string]$property.Value
+        }
+        return $hashMap
+    } finally {
+        Remove-Item -LiteralPath $tempPythonPath, $tempConfigPath, $tempKeysPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Merge-GlobalMcpConfig {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ProviderConfigText,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$GlobalConfigText
+    )
+
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $pythonCode = @'
+import copy
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+def parse_config(text, label):
+    try:
+        return tomllib.loads(text)
+    except Exception as exc:
+        raise RuntimeError(f"{label} is not valid TOML.") from exc
+
+def table_root(line):
+    stripped = line.strip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parsed = tomllib.loads(stripped + "\n")
+    except Exception:
+        return None
+    if len(parsed) != 1:
+        return None
+    return next(iter(parsed))
+
+def split_table_blocks(text):
+    blocks = []
+    current_lines = []
+    current_root = None
+    for line in text.splitlines(keepends=True):
+        root = table_root(line)
+        if root is not None:
+            if current_lines:
+                blocks.append((current_root, current_lines))
+            current_lines = [line]
+            current_root = root
+        else:
+            current_lines.append(line)
+    if current_lines:
+        blocks.append((current_root, current_lines))
+    return blocks
+
+provider_text = Path(sys.argv[1]).read_text(encoding="utf-8")
+global_text = Path(sys.argv[2]).read_text(encoding="utf-8")
+provider_config = parse_config(provider_text, "Provider config")
+global_config = parse_config(global_text, "Global Codex config")
+
+global_mcp = global_config.get("mcp_servers", {})
+if not isinstance(global_mcp, dict):
+    raise RuntimeError("Global mcp_servers must be a TOML table.")
+if any(not isinstance(value, dict) for value in global_mcp.values()):
+    raise RuntimeError("Every global MCP server must be a TOML table.")
+
+provider_blocks = split_table_blocks(provider_text)
+provider_without_mcp = "".join(
+    "".join(lines) for root, lines in provider_blocks if root != "mcp_servers"
+)
+provider_base = copy.deepcopy(provider_config)
+provider_base.pop("mcp_servers", None)
+if parse_config(provider_without_mcp, "Provider config without MCP") != provider_base:
+    raise RuntimeError("Could not remove the provider mcp_servers subtree without changing other settings.")
+
+if global_mcp:
+    global_blocks = split_table_blocks(global_text)
+    global_mcp_text = "".join(
+        "".join(lines) for root, lines in global_blocks if root == "mcp_servers"
+    ).strip()
+    if not global_mcp_text:
+        raise RuntimeError("Global mcp_servers uses an unsupported inline or dotted-key layout.")
+    extracted = parse_config(global_mcp_text, "Extracted global MCP config").get("mcp_servers")
+    if extracted != global_mcp:
+        raise RuntimeError("Extracted global MCP config does not match the parsed mcp_servers subtree.")
+    merged_text = provider_without_mcp.rstrip() + "\n\n" + global_mcp_text + "\n"
+else:
+    merged_text = provider_without_mcp.rstrip() + "\n"
+
+merged_config = parse_config(merged_text, "Merged Codex config")
+merged_base = copy.deepcopy(merged_config)
+merged_result_mcp = merged_base.pop("mcp_servers", {})
+if merged_base != provider_base:
+    raise RuntimeError("MCP merge changed provider settings outside mcp_servers.")
+if merged_result_mcp != global_mcp:
+    raise RuntimeError("Merged mcp_servers does not match the global Codex config.")
+
+print(json.dumps({
+    "ok": True,
+    "config": merged_text,
+    "serverNames": sorted(global_mcp.keys()),
+}, ensure_ascii=True))
+'@
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $suffix = "$PID-$([guid]::NewGuid().ToString('N'))"
+    $tempPythonPath = Join-Path $tempRoot "ccswitch-mcp-merge-$suffix.py"
+    $tempProviderPath = Join-Path $tempRoot "ccswitch-mcp-provider-$suffix.toml"
+    $tempGlobalPath = Join-Path $tempRoot "ccswitch-mcp-global-$suffix.toml"
+    try {
+        Write-Utf8NoBom -Path $tempPythonPath -Content $pythonCode
+        Write-Utf8NoBom -Path $tempProviderPath -Content $ProviderConfigText
+        Write-Utf8NoBom -Path $tempGlobalPath -Content $GlobalConfigText
+        $output = & $python $tempPythonPath $tempProviderPath $tempGlobalPath
+        if ($LASTEXITCODE -ne 0) { throw "Global MCP merge failed with exit code $LASTEXITCODE." }
+        $mergeResponse = (($output | Out-String).Trim() | ConvertFrom-Json)
+        if (-not [bool]$mergeResponse.ok) { throw 'Global MCP merge failed.' }
+        return [pscustomobject]@{
+            ConfigText = [string]$mergeResponse.config
+            ServerNames = @($mergeResponse.serverNames)
+        }
+    } finally {
+        Remove-Item -LiteralPath $tempPythonPath, $tempProviderPath, $tempGlobalPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Add-RunHomeHookTrustState {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ConfigText,
+        [Parameter(Mandatory = $true)][string]$HookPath,
+        [Parameter(Mandatory = $true)][string[]]$HookKeys,
+        [Parameter(Mandatory = $true)][hashtable]$TrustedHashes
+    )
+
+    # Codex keys hook trust by the concrete hooks.json path. Each provider run gets
+    # a fresh CODEX_HOME, so carry the already-reviewed hashes to that run-local path.
+    $ConfigText = $ConfigText -replace "`r`n", "`n"
+    $normalizedHookPath = [System.IO.Path]::GetFullPath($HookPath)
+
+    foreach ($hookKey in $HookKeys) {
+        $trustedHash = [string]$TrustedHashes[$hookKey]
+        $block = "[hooks.state.'{0}:{1}']`ntrusted_hash = `"{2}`"`n" -f `
+            $normalizedHookPath,
+            $hookKey,
+            $trustedHash
+        $ConfigText = $ConfigText.TrimEnd() + "`n`n" + $block
+    }
+
+    return $ConfigText
+}
+
+function Get-StableGlobalConfigAndHookSnapshot {
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    $lastProblem = 'No global hook snapshot attempt completed.'
+    do {
+        try {
+            $hooksBytesBefore = [IO.File]::ReadAllBytes($GlobalHooksPath)
+            $configText = Get-TextFileContent -Path $GlobalConfigPath
+            $hooksBytesAfter = [IO.File]::ReadAllBytes($GlobalHooksPath)
+            $beforeHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($hooksBytesBefore))
+            $afterHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($hooksBytesAfter))
+            if ($beforeHash -ne $afterHash) {
+                $lastProblem = 'Global hooks.json changed while its trust snapshot was read.'
+                continue
+            }
+            $hooksText = [Text.UTF8Encoding]::new($false, $true).GetString($hooksBytesBefore).TrimStart([char]0xFEFF)
+            $hookKeys = @(Get-ConfiguredHookKeys -HooksConfigText $hooksText)
+            $trustedHashes = Get-TrustedHookHashMap `
+                -ConfigText $configText `
+                -SourceHookPath $GlobalHooksPath `
+                -HookKeys $hookKeys
+            return [pscustomobject]@{
+                HooksConfigBytes = $hooksBytesBefore
+                GlobalConfigText = $configText
+                HookKeys = $hookKeys
+                TrustedHashes = $trustedHashes
+            }
+        } catch {
+            $lastProblem = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Unable to capture a stable global hook trust snapshot within 3 seconds. Last error: $lastProblem"
+}
+
+function Set-ResilientStreamSettings {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigText
+    )
+
+    # Keep the transport tolerant of slow third-party Responses relays without
+    # changing provider URLs, authentication, or the selected model.
+    $updated = [regex]::Replace(
+        $ConfigText,
+        '(?m)^((?:["'']?stream_max_retries["'']?)[ \t]*=[ \t]*)\d+',
+        '${1}10'
+    )
+    return [regex]::Replace(
+        $updated,
+        '(?m)^((?:["'']?stream_idle_timeout_ms["'']?)[ \t]*=[ \t]*)\d+',
+        '${1}300000'
+    )
+}
+
+$hookSnapshot = Get-StableGlobalConfigAndHookSnapshot
 $details = Get-StableCcSwitchSnapshot
 $safeProviderId = ConvertTo-SafeName -Value ([string]$details.provider.id)
 $runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -493,8 +874,23 @@ $runSuffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
 $profileName = "ccswitch-run-$runStamp-$($safeProviderId.Substring(0, [Math]::Min(8, $safeProviderId.Length)))-$runSuffix"
 $codexHome = Join-Path $RunHomesRoot $profileName
 $runProdexHome = Join-Path $codexHome '.prodex-runtime'
+$runHooksPath = Join-Path $codexHome 'hooks.json'
 $stagingName = ".ccswitch-staging-$profileName-$([guid]::NewGuid().ToString('N'))"
 $stagingHome = Join-Path $RunHomesRoot $stagingName
+
+# MCP registrations are user-local runtime settings. Keep the live global
+# subtree authoritative instead of reviving a stale copy from the provider DB.
+$mcpMerge = Merge-GlobalMcpConfig `
+    -ProviderConfigText ([string]$details.config) `
+    -GlobalConfigText ([string]$hookSnapshot.GlobalConfigText)
+$details.config = [string]$mcpMerge.ConfigText
+$details.config = Set-ResilientStreamSettings -ConfigText ([string]$details.config)
+$details.config = Add-RunHomeHookTrustState `
+    -ConfigText ([string]$details.config) `
+    -HookPath $runHooksPath `
+    -HookKeys $hookSnapshot.HookKeys `
+    -TrustedHashes $hookSnapshot.TrustedHashes
+$details.configSha256 = Get-ShortSha256Text -Text ([string]$details.config)
 
 $metadata = [pscustomobject]@{
     schemaVersion = 2
@@ -503,6 +899,7 @@ $metadata = [pscustomobject]@{
     prodexHome = $runProdexHome
     providerId = $details.provider.id
     providerName = $details.provider.name
+    ccSwitchRoot = $CcSwitchRoot
     baseUrl = $details.provider.baseUrl
     baseHost = $details.provider.baseHost
     endpointHost = $details.provider.endpointHost
@@ -510,6 +907,8 @@ $metadata = [pscustomobject]@{
     authSha256 = $details.authSha256
     model = $details.model
     modelReasoningEffort = $details.modelReasoningEffort
+    mcpServerNames = @($mcpMerge.ServerNames)
+    hookTrustByKey = $hookSnapshot.TrustedHashes
     launchMode = $LaunchMode
     materializedAt = (Get-Date).ToString('o')
 }
@@ -521,7 +920,9 @@ try {
     New-Item -ItemType Directory -Path $stagingHome -ErrorAction Stop | Out-Null
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'config.toml') -Content ([string]$details.config)
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'auth.json') -Content ([string]$details.authJson)
-    Initialize-CodexHomeRulesAndSkills -CodexHomePath $stagingHome
+    Initialize-CodexHomeRulesAndSkills `
+        -CodexHomePath $stagingHome `
+        -HooksConfigBytes $hookSnapshot.HooksConfigBytes
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'run-provider.json') -Content (($metadata | ConvertTo-Json -Depth 8) + "`n")
     Test-StagedCodexHome `
         -StagingHome $stagingHome `

@@ -5,9 +5,10 @@ param(
     [string]$RunHome,
 
     [long]$ExitOrder = 0,
-    [string]$CcSwitchRoot = (Join-Path $env:USERPROFILE '.cc-switch'),
+    [string]$CcSwitchRoot = '',
     [string]$SyncScript = (Join-Path $env:USERPROFILE '.prodex\bin\sync-ccswitch-current-codex.ps1'),
     [string]$AllowedRunHomesRoot = '',
+    [string]$ChangedFieldsCsv = '',
     [switch]$DryRun,
     [switch]$Json
 )
@@ -15,6 +16,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+. (Join-Path $PSScriptRoot 'resolve-ccswitch-root.ps1')
 
 $userRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     [Environment]::GetFolderPath('UserProfile')
@@ -24,6 +26,13 @@ $userRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
 if ([string]::IsNullOrWhiteSpace($userRoot)) {
     throw 'Unable to resolve the user profile directory.'
 }
+$CcSwitchRoot = Resolve-CcSwitchRoot -ExplicitRoot $CcSwitchRoot -UserRoot $userRoot -AppDataRoot $env:APPDATA
+$canonicalCcSwitchRoot = Resolve-CcSwitchRoot -UserRoot $userRoot -AppDataRoot $env:APPDATA
+$isCanonicalCcSwitchRoot = [string]::Equals(
+    $CcSwitchRoot.TrimEnd('\', '/'),
+    $canonicalCcSwitchRoot.TrimEnd('\', '/'),
+    [StringComparison]::OrdinalIgnoreCase
+)
 $prodexRoot = if ([string]::IsNullOrWhiteSpace($env:PRODEX_HOME)) {
     Join-Path $userRoot '.prodex'
 } else {
@@ -34,6 +43,14 @@ if ($ExitOrder -le 0) {
 }
 if ([string]::IsNullOrWhiteSpace($AllowedRunHomesRoot)) {
     $AllowedRunHomesRoot = Join-Path $prodexRoot 'manual-homes\ccswitch-runs'
+}
+$changedFields = @($ChangedFieldsCsv -split ',' |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+foreach ($field in $changedFields) {
+    if ($field -notin @('model', 'model_reasoning_effort')) {
+        throw "ChangedFieldsCsv contains an unsupported field: $field"
+    }
 }
 
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
@@ -63,10 +80,9 @@ MODEL_KEY = "model"
 EFFORT_KEY = "model_reasoning_effort"
 EXIT_ORDER_KEY = "_ccswitchCodexModelExitOrder"
 MISSING = object()
-TABLE_HEADER = re.compile(r"^[ \t]*\[\[?[^\]\r\n]+\]\]?[ \t]*(?:#.*)?(?:\r?\n)?$")
-ASSIGNMENT = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<key>model|model_reasoning_effort)"
-    r"(?P<before_eq>[ \t]*)=(?P<value>.*?)(?P<newline>\r?\n)?$"
+ASSIGNMENT_PREFIX = re.compile(
+    r'^(?P<indent>[ \t]*)(?P<quote>["\']?)(?P<key>model|model_reasoning_effort)(?P=quote)'
+    r"(?P<before_eq>[ \t]*)=(?P<after_eq>[ \t]*)"
 )
 
 
@@ -209,6 +225,14 @@ def public_changes(baseline_model, baseline_effort, run_model, run_effort):
     return changes
 
 
+def merge_changes(detected, explicit):
+    changes = list(detected)
+    for field in explicit:
+        if field not in changes:
+            changes.append(field)
+    return changes
+
+
 def toml_string(value):
     return json.dumps(value, ensure_ascii=True)
 
@@ -220,6 +244,221 @@ def without_model_settings(parsed):
     return value
 
 
+def new_scan_state():
+    return {"string": None, "array_depth": 0, "escaped": False}
+
+
+def quote_run_length(text, index, character):
+    end = index
+    while end < len(text) and text[end] == character:
+        end += 1
+    return end - index
+
+
+def scan_toml_line(line, state):
+    mode = state["string"]
+    array_depth = state["array_depth"]
+    escaped = state["escaped"]
+    index = 0
+    while index < len(line):
+        if mode == "basic_multi":
+            if line.startswith('"""', index) and not escaped:
+                mode = None
+                escaped = False
+                index += quote_run_length(line, index, '"')
+                continue
+            character = line[index]
+            if character == "\\" and not escaped:
+                escaped = True
+            else:
+                escaped = False
+            index += 1
+            continue
+        if mode == "literal_multi":
+            if line.startswith("'''", index):
+                mode = None
+                index += quote_run_length(line, index, "'")
+                continue
+            index += 1
+            continue
+        if mode == "basic":
+            character = line[index]
+            if character == '"' and not escaped:
+                mode = None
+            if character == "\\" and not escaped:
+                escaped = True
+            else:
+                escaped = False
+            index += 1
+            continue
+        if mode == "literal":
+            if line[index] == "'":
+                mode = None
+            index += 1
+            continue
+
+        character = line[index]
+        if character == "#":
+            break
+        if line.startswith('"""', index):
+            mode = "basic_multi"
+            escaped = False
+            index += 3
+            continue
+        if line.startswith("'''", index):
+            mode = "literal_multi"
+            index += 3
+            continue
+        if character == '"':
+            mode = "basic"
+            escaped = False
+        elif character == "'":
+            mode = "literal"
+        elif character == "[":
+            array_depth += 1
+        elif character == "]" and array_depth > 0:
+            array_depth -= 1
+        index += 1
+    return {"string": mode, "array_depth": array_depth, "escaped": escaped}
+
+
+def is_table_header(line, state):
+    if state["string"] is not None or state["array_depth"] != 0:
+        return False
+    stripped = line.lstrip(" \t")
+    return bool(stripped) and stripped[0] == "["
+
+
+def find_comment_index(text):
+    state = new_scan_state()
+    index = 0
+    while index < len(text):
+        mode = state["string"]
+        if mode == "basic_multi":
+            if text.startswith('"""', index) and not state["escaped"]:
+                state["string"] = None
+                state["escaped"] = False
+                index += quote_run_length(text, index, '"')
+                continue
+            character = text[index]
+            if character == "\\" and not state["escaped"]:
+                state["escaped"] = True
+            else:
+                state["escaped"] = False
+            index += 1
+            continue
+        if mode == "literal_multi":
+            if text.startswith("'''", index):
+                state["string"] = None
+                index += quote_run_length(text, index, "'")
+                continue
+            index += 1
+            continue
+        if mode == "basic":
+            character = text[index]
+            if character == '"' and not state["escaped"]:
+                state["string"] = None
+            if character == "\\" and not state["escaped"]:
+                state["escaped"] = True
+            else:
+                state["escaped"] = False
+            index += 1
+            continue
+        if mode == "literal":
+            if text[index] == "'":
+                state["string"] = None
+            index += 1
+            continue
+
+        character = text[index]
+        if character == "#":
+            return index
+        if text.startswith('"""', index):
+            state["string"] = "basic_multi"
+            state["escaped"] = False
+            index += 3
+            continue
+        if text.startswith("'''", index):
+            state["string"] = "literal_multi"
+            index += 3
+            continue
+        if character == '"':
+            state["string"] = "basic"
+            state["escaped"] = False
+        elif character == "'":
+            state["string"] = "literal"
+        index += 1
+    return None
+
+
+def collect_top_level_assignments(lines):
+    state = new_scan_state()
+    first_table = len(lines)
+    positions = {MODEL_KEY: [], EFFORT_KEY: []}
+    matches = {}
+    for index, line in enumerate(lines):
+        if is_table_header(line, state):
+            first_table = index
+            break
+        match = None
+        if state["string"] is None and state["array_depth"] == 0:
+            match = ASSIGNMENT_PREFIX.match(line)
+            if match:
+                key = match.group("key")
+                positions[key].append(index)
+        next_state = scan_toml_line(line, state)
+        if match:
+            matches[index] = (match, next_state)
+        state = next_state
+    return first_table, positions, matches
+
+
+def replace_assignment_line(line, match, value):
+    line_ending = ""
+    content = line
+    if content.endswith("\r\n"):
+        line_ending = "\r\n"
+        content = content[:-2]
+    elif content.endswith(("\n", "\r")):
+        line_ending = content[-1]
+        content = content[:-1]
+    remainder = content[match.end():]
+    value_region = remainder.lstrip(" \t")
+    value_quote = value_region[:1]
+    comment_index = find_comment_index(remainder)
+    if comment_index is None:
+        trailing = re.search(r"[ \t]*$", remainder).group(0)
+        suffix = trailing + line_ending
+    else:
+        before_comment = remainder[:comment_index]
+        trailing = re.search(r"[ \t]*$", before_comment).group(0)
+        suffix = trailing + remainder[comment_index:] + line_ending
+    rendered_value = toml_string(value)
+    if (
+        value_region.startswith('"""')
+        and '"""' not in value
+        and "\r" not in value
+        and "\n" not in value
+    ):
+        rendered_value = '"""' + value + '"""'
+    elif (
+        value_region.startswith("'''")
+        and "'''" not in value
+        and "\r" not in value
+        and "\n" not in value
+    ):
+        rendered_value = "'''" + value + "'''"
+    elif (
+        value_quote == "'"
+        and isinstance(value, str)
+        and "'" not in value
+        and "\r" not in value
+        and "\n" not in value
+    ):
+        rendered_value = "'" + value + "'"
+    return content[:match.end()] + rendered_value + suffix
+
+
 def rewrite_top_level_config(original, desired_model, desired_effort):
     parsed_before = parse_toml(
         original,
@@ -227,23 +466,15 @@ def rewrite_top_level_config(original, desired_model, desired_effort):
         "The provider config is not valid TOML; no changes were made.",
     )
     lines = original.splitlines(keepends=True)
-    first_table = len(lines)
-    for index, line in enumerate(lines):
-        if TABLE_HEADER.match(line):
-            first_table = index
-            break
-
-    positions = {MODEL_KEY: [], EFFORT_KEY: []}
-    matches = {}
-    for index in range(first_table):
-        match = ASSIGNMENT.match(lines[index])
-        if match:
-            key = match.group("key")
-            positions[key].append(index)
-            matches[index] = match
+    first_table, positions, matches = collect_top_level_assignments(lines)
 
     for key in (MODEL_KEY, EFFORT_KEY):
         parsed_has_key = key in parsed_before
+        if parsed_has_key and not isinstance(parsed_before[key], str):
+            fail(
+                "unsupported_provider_config",
+                "The provider config uses a non-string top-level model assignment format; no changes were made.",
+            )
         if len(positions[key]) > 1 or (parsed_has_key and len(positions[key]) != 1):
             fail(
                 "unsupported_provider_config",
@@ -264,11 +495,16 @@ def rewrite_top_level_config(original, desired_model, desired_effort):
             if value is None:
                 removals.add(index)
             else:
-                match = matches[index]
-                line_ending = match.group("newline") or ""
-                replacements[index] = (
-                    f'{match.group("indent")}{key}{match.group("before_eq")}='
-                    f' {toml_string(value)}{line_ending}'
+                match, state_after = matches[index]
+                if state_after["string"] is not None or state_after["array_depth"] != 0:
+                    fail(
+                        "unsupported_provider_config",
+                        "The provider config uses a multiline model assignment format; no changes were made.",
+                    )
+                replacements[index] = replace_assignment_line(
+                    lines[index],
+                    match,
+                    value,
                 )
         elif value is not None:
             insertions.append(f"{key} = {toml_string(value)}{newline}")
@@ -501,11 +737,14 @@ def main(args):
             "unsupported_model_removal",
             "Removing an existing provider model is not supported; no changes were made.",
         )
-    changed_fields = public_changes(
-        baseline_model,
-        baseline_effort,
-        run_model,
-        run_effort,
+    changed_fields = merge_changes(
+        public_changes(
+            baseline_model,
+            baseline_effort,
+            run_model,
+            run_effort,
+        ),
+        args.changed_field,
     )
     if not changed_fields:
         result = base_result("skipped", provider_id, changed_fields)
@@ -677,6 +916,12 @@ def parse_args():
     parser.add_argument("--allowed-run-homes-root", required=True)
     parser.add_argument("--exit-order", required=True, type=int)
     parser.add_argument("--result-path", required=True)
+    parser.add_argument(
+        "--changed-field",
+        action="append",
+        choices=(MODEL_KEY, EFFORT_KEY),
+        default=[],
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -716,20 +961,10 @@ $tempResultPath = Join-Path ([System.IO.Path]::GetTempPath()) "persist-run-model
 $previousPythonIoEncoding = $env:PYTHONIOENCODING
 $previousPythonUtf8 = $env:PYTHONUTF8
 $pythonExitCode = 1
-$mutexIdentity = try {
-    [System.IO.Path]::GetFullPath($CcSwitchRoot).ToLowerInvariant()
-} catch {
-    ([string]$CcSwitchRoot).ToLowerInvariant()
-}
-$sha256 = [System.Security.Cryptography.SHA256]::Create()
-try {
-    $mutexHash = ([System.BitConverter]::ToString(
-        $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($mutexIdentity))
-    )).Replace('-', '')
-} finally {
-    $sha256.Dispose()
-}
-$persistenceMutex = [System.Threading.Mutex]::new($false, "Local\ccswitch-codex-model-persist-$mutexHash")
+$persistenceMutex = [System.Threading.Mutex]::new(
+    $false,
+    (Get-CcSwitchRootMutexName -Root $CcSwitchRoot)
+)
 $persistenceLockTaken = $false
 
 try {
@@ -753,6 +988,9 @@ try {
         '--exit-order', ([string]$ExitOrder),
         '--result-path', $tempResultPath
     )
+    foreach ($field in $changedFields) {
+        $arguments += @('--changed-field', [string]$field)
+    }
     if ($DryRun) {
         $arguments += '--dry-run'
     }
@@ -770,12 +1008,9 @@ try {
         $env:PYTHONUTF8 = $previousPythonUtf8
     }
     Remove-Item -LiteralPath $tempPythonPath -Force -ErrorAction SilentlyContinue
-    if ($persistenceLockTaken) {
-        $persistenceMutex.ReleaseMutex()
-    }
-    $persistenceMutex.Dispose()
 }
 
+try {
 try {
     if (-not (Test-Path -LiteralPath $tempResultPath)) {
         throw 'The persistence engine did not return a result.'
@@ -791,7 +1026,7 @@ $mirrorStatuses = [ordered]@{
 }
 $warnings = [System.Collections.Generic.List[string]]::new()
 
-if ([bool]$result.ok -and -not $DryRun -and [bool]$result.syncEligible -and
+if ([bool]$result.ok -and -not $DryRun -and $isCanonicalCcSwitchRoot -and [bool]$result.syncEligible -and
     $result.status -notin @('skipped', 'superseded')) {
     if (-not (Test-Path -LiteralPath $SyncScript -PathType Leaf)) {
         $mirrorStatuses.ccswitchCurrent = 'failed'
@@ -808,7 +1043,10 @@ if ([bool]$result.ok -and -not $DryRun -and [bool]$result.syncEligible -and
             for ($attempt = 1; $attempt -le 2; $attempt++) {
                 try {
                     $global:LASTEXITCODE = 0
-                    $null = @(& $SyncScript -CcSwitchRoot $CcSwitchRoot -CodexHome $targetPaths -Quiet 2>&1)
+                    $null = @(& $SyncScript `
+                        -CcSwitchRoot $CcSwitchRoot `
+                        -CodexHome $targetPaths `
+                        -Quiet 2>&1)
                     if ($LASTEXITCODE -ne 0) {
                         throw 'sync failed'
                     }
@@ -832,12 +1070,22 @@ if ([bool]$result.ok -and -not $DryRun -and [bool]$result.syncEligible -and
             $warnings.Add('The model was persisted, but the current-provider mirrors could not be synchronized.')
         }
     }
+} elseif ([bool]$result.ok -and -not $DryRun -and -not $isCanonicalCcSwitchRoot -and
+    [bool]$result.syncEligible -and $result.status -notin @('skipped', 'superseded')) {
+    $mirrorStatuses.ccswitchCurrent = 'non_canonical_root'
+    $mirrorStatuses.globalCodex = 'non_canonical_root'
 } elseif ([bool]$result.ok -and $DryRun) {
     $mirrorStatuses.ccswitchCurrent = 'dry_run'
     $mirrorStatuses.globalCodex = 'dry_run'
 } elseif ([bool]$result.ok -and $result.status -notin @('skipped', 'superseded')) {
     $mirrorStatuses.ccswitchCurrent = 'provider_not_current'
     $mirrorStatuses.globalCodex = 'provider_not_current'
+}
+} finally {
+    if ($persistenceLockTaken) {
+        $persistenceMutex.ReleaseMutex()
+    }
+    $persistenceMutex.Dispose()
 }
 
 if ([bool]$result.ok) {
