@@ -6,7 +6,7 @@ param(
 
     [long]$ExitOrder = 0,
     [string]$CcSwitchRoot = (Join-Path $env:USERPROFILE '.cc-switch'),
-    [string]$SyncScript = (Join-Path $env:USERPROFILE '.prodex\bin\sync-ccswitch-current-codex.ps1'),
+    [string]$SyncScript = (Join-Path $env:USERPROFILE '.codex\bin\sync-ccswitch-current.ps1'),
     [string]$AllowedRunHomesRoot = '',
     [switch]$DryRun,
     [switch]$Json

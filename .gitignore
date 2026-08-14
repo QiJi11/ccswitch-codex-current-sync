@@ -13,6 +13,8 @@ state_*.sqlite
 *.tmp
 .tmp/
 tmp/
+__pycache__/
+*.py[cod]
 
 # Editor/OS noise.
 .DS_Store

@@ -89,14 +89,15 @@ def make_activation_case(
             connection.executescript(
                 """
                 create table providers (
-                    id text, app_type text, name text, is_current integer, settings_config text
+                    id text, app_type text, name text, is_current integer,
+                    sort_index integer, settings_config text
                 );
                 create table proxy_config (
                     app_type text, enabled integer, proxy_enabled integer,
                     live_takeover_active integer
                 );
                 insert into providers values (
-                    'provider-id', 'codex', 'BLA codex3 0.165 pro', 1, ''
+                    'provider-id', 'codex', 'BLA codex3 0.165 pro', 1, 0, ''
                 );
                 insert into proxy_config values ('codex', 1, 1, 1);
                 """
@@ -118,12 +119,12 @@ def make_activation_case(
 
 
 class DirectProviderActivationTests(unittest.TestCase):
-    def test_luna_route_preserves_distinct_fast_model(self) -> None:
+    def test_luna_route_uses_the_same_fast_model(self) -> None:
         _, config = MODULE.rendered_live_config(
             LIVE_CONFIG, stored_route("gpt-5.6-luna", "gpt-5.6-sol")
         )
         self.assertEqual(config["model"], "gpt-5.6-luna")
-        self.assertEqual(config["model_fast"], "gpt-5.6-sol")
+        self.assertEqual(config["model_fast"], "gpt-5.6-luna")
         self.assertEqual(
             config["model_catalog_json"],
             str(Path.home() / ".codex" / MODULE.MODEL_CATALOG_FILENAME),
@@ -191,6 +192,18 @@ class DirectProviderActivationTests(unittest.TestCase):
         route.provider_table["base_url"] = "https://api.openai.com/v1"
         with self.assertRaises(ValueError):
             MODULE.rendered_live_config(LIVE_CONFIG, route)
+
+    def test_retired_local_provider_is_rejected(self) -> None:
+        for base_url in (
+            "http://127.0.0.1:15721",
+            "https://localhost/v1",
+            "https://[::1]/v1",
+        ):
+            with self.subTest(base_url=base_url):
+                route = stored_route("gpt-5.6-luna", "gpt-5.6-sol")
+                route.provider_table["base_url"] = base_url
+                with self.assertRaises(ValueError):
+                    MODULE.rendered_live_config(LIVE_CONFIG, route)
 
     def test_base_url_credentials_and_query_are_rejected(self) -> None:
         for base_url in (

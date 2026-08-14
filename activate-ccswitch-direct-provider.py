@@ -1,11 +1,13 @@
 import argparse
 from contextlib import closing
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import sqlite3
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +56,26 @@ class StoredRoute:
     provider_table: dict
     api_key: str
     display_name: str
+
+
+def load_global_writer():
+    candidates = (
+        Path(__file__).resolve().with_name("persist-codex-fast-all-providers.py"),
+        Path(__file__).resolve().parent
+        / "scripts"
+        / "persist-codex-fast-all-providers.py",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("codex_global_runtime_writer", candidate)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError("The unified Codex global runtime writer was not found.")
 
 
 def toml_scalar(value: object) -> str:
@@ -242,7 +264,7 @@ def route_scalar_values(route: StoredRoute) -> dict:
     return {
         **APP_SCALAR_OVERRIDES,
         "model": model,
-        "model_fast": route.config.get("model_fast"),
+        "model_fast": model,
         # Keep model discovery local; third-party /models responses are not
         # guaranteed to match Codex's catalog schema.
         "model_catalog_json": str(Path.home() / ".codex" / MODEL_CATALOG_FILENAME),
@@ -292,11 +314,19 @@ def activate(root: Path, codex_root: Path, provider_id: str, backup_path: Path) 
     if db_backup_path.exists():
         raise FileExistsError(f"Database backup already exists: {db_backup_path}")
 
-    live_text = config_path.read_text(encoding="utf-8")
-    updated_text, updated_config = rendered_live_config(live_text, route)
-    normalized_stored_text, _ = rendered_live_config(provider_settings["config"], route)
-    normalized_provider_settings = dict(provider_settings)
-    normalized_provider_settings["config"] = normalized_stored_text
+    writer = load_global_writer()
+    writer_report = writer.run_migration(
+        database_path,
+        root / "settings.json",
+        config_path,
+        writer.MigrationOptions(
+            apply=True,
+            database_backup_path=db_backup_path,
+            config_backup_path=backup_path,
+        ),
+        provider_id=provider_id,
+    )
+    updated_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     active_provider = updated_config["model_providers"][route.provider_id]
     validate_direct_base_url(active_provider.get("base_url"))
     if active_provider.get("base_url") != route.provider_table.get("base_url"):
@@ -305,53 +335,11 @@ def activate(root: Path, codex_root: Path, provider_id: str, backup_path: Path) 
         raise ValueError("Activated provider token validation failed.")
     if active_provider.get("requires_openai_auth") is not False:
         raise ValueError("Activated provider must not reuse ChatGPT auth for API requests.")
-    if active_provider.get("name") != route.display_name:
+    if active_provider.get("name") != "custom":
         raise ValueError("Activated provider display name validation failed.")
-    for key, expected in route_scalar_values(route).items():
-        if updated_config.get(key) != expected:
-            raise ValueError(f"Activated App {key} validation failed.")
-
-    current_provider_settings(root, provider_id)
-    shutil.copy2(config_path, backup_path)
-    config_written = False
-    try:
-        atomic_write(config_path, updated_text)
-        config_written = True
-
-        # Perform DB backup and disable proxy flags for codex.
-        with closing(sqlite3.connect(database_path, timeout=15)) as connection:
-            with closing(sqlite3.connect(db_backup_path)) as backup_conn:
-                connection.backup(backup_conn)
-            with connection:
-                current_ids = connection.execute(
-                    "select id from providers where app_type='codex' and is_current=1"
-                ).fetchall()
-                if current_ids != [(provider_id,)]:
-                    raise ValueError("CC Switch provider changed before activation commit.")
-                connection.execute(
-                    "update providers set settings_config=? where app_type='codex' and id=?",
-                    (
-                        json.dumps(normalized_provider_settings, ensure_ascii=False),
-                        provider_id,
-                    ),
-                )
-                connection.execute(
-                    "update proxy_config set enabled=0, proxy_enabled=0, live_takeover_active=0 "
-                    "where app_type='codex'"
-                )
-    except Exception:
-        if config_written:
-            try:
-                atomic_write(config_path, live_text)
-            except Exception as rollback_error:
-                raise RuntimeError(
-                    "Activation failed and live config rollback also failed."
-                ) from rollback_error
-        raise
-
     return {
         "providerId": provider_id,
-        "providerName": route.display_name,
+        "providerName": "custom",
         "baseUrl": active_provider["base_url"],
         "model": updated_config.get("model"),
         "modelFast": updated_config.get("model_fast"),
@@ -359,6 +347,7 @@ def activate(root: Path, codex_root: Path, provider_id: str, backup_path: Path) 
         "serviceTier": updated_config.get("service_tier"),
         "requiresOpenAIAuth": active_provider.get("requires_openai_auth"),
         "apiKeyDigest": hashlib.sha256(route.api_key.encode("utf-8")).hexdigest()[:12],
+        "globalWriter": writer_report,
     }
 
 

@@ -25,6 +25,8 @@ SPEC.loader.exec_module(MODULE)
 def provider_config(
     model: str | None,
     *,
+    display_name: str = "Stored Provider",
+    base_url: str = "https://provider.example/v1",
     model_fast: str | None = None,
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
@@ -45,7 +47,8 @@ def provider_config(
         [
             'model_provider = "custom"',
             "[model_providers.custom]",
-            'base_url = "https://provider.example/v1"',
+            f'base_url = "{base_url}"',
+            f'name = "{display_name}"',
             'wire_api = "responses"',
             'service_tier = "transport-default"',
         ]
@@ -63,6 +66,7 @@ def provider_config(
 
 def global_config(
     *,
+    display_name: str = "Stored Global",
     model: str = "gpt-5.6-sol",
     model_fast: str = "gpt-5.6-luna",
     reasoning_effort: str = "medium",
@@ -83,6 +87,11 @@ def global_config(
         lines.append(f'model_catalog_json = "{escaped_catalog}"')
     lines.extend(
         [
+            'model_provider = "custom"',
+            "[model_providers.custom]",
+            'base_url = "https://provider.example/v1"',
+            f'name = "{display_name}"',
+            'wire_api = "responses"',
             "[features]",
             f"fast_mode = {str(fast_mode).lower()}",
             "[desktop]",
@@ -176,7 +185,124 @@ def provider_rows(database: Path) -> list[tuple[str, str]]:
 
 
 class PersistCodexGlobalRuntimeTests(unittest.TestCase):
-    def test_apply_synchronizes_global_policy_and_preserves_provider_route(self) -> None:
+    def test_name_only_migration_normalizes_all_providers_without_other_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, settings_path, _ = make_database(root)
+            config_path = root / "config.toml"
+            config_path.write_text(global_config(), encoding="utf-8")
+            connection = sqlite3.connect(database)
+            try:
+                row = connection.execute(
+                    "select settings_config from providers where id='provider-c'"
+                ).fetchone()
+                settings = json.loads(row[0])
+                settings["config"] = provider_config(
+                    None,
+                    display_name="Legacy Local",
+                    base_url="http://127.0.0.1:15721",
+                    nested_features=True,
+                )
+                connection.execute(
+                    "update providers set settings_config=? where id='provider-c'",
+                    (json.dumps(settings, separators=(",", ":")),),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            before_names = self.provider_names(database)
+            before_settings = settings_path.read_text(encoding="utf-8")
+            before_configs = self.provider_settings(database)
+            before_global = MODULE.tomllib.loads(
+                config_path.read_text(encoding="utf-8")
+            )
+            database_backup = root / "before-name.db"
+            settings_backup = root / "before-settings.json"
+            config_backup = root / "before-name.toml"
+
+            report = MODULE.run_provider_name_migration(
+                database,
+                settings_path,
+                config_path,
+                MODULE.MigrationOptions(
+                    apply=True,
+                    database_backup_path=database_backup,
+                    settings_backup_path=settings_backup,
+                    config_backup_path=config_backup,
+                ),
+            )
+
+            self.assertTrue(report["allAligned"])
+            self.assertEqual(report["providerCount"], 3)
+            self.assertEqual(report["changedCount"], 3)
+            self.assertEqual(self.provider_names(database), before_names)
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), before_settings)
+            self.assertEqual(settings_backup.read_text(encoding="utf-8"), before_settings)
+            after_configs = self.provider_settings(database)
+            for provider_id, before_settings_config in before_configs.items():
+                after_settings_config = after_configs[provider_id]
+                self.assertEqual(
+                    before_settings_config.get("auth"),
+                    after_settings_config.get("auth"),
+                )
+                before_config = MODULE.tomllib.loads(
+                    before_settings_config["config"]
+                )
+                after_config = MODULE.tomllib.loads(after_settings_config["config"])
+                self.assertEqual(
+                    MODULE.config_without_provider_name(before_config),
+                    MODULE.config_without_provider_name(after_config),
+                )
+                self.assertEqual(
+                    after_config["model_providers"]["custom"]["name"],
+                    "custom",
+                )
+            after_global = MODULE.tomllib.loads(
+                config_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                MODULE.config_without_provider_name(before_global),
+                MODULE.config_without_provider_name(after_global),
+            )
+            self.assertEqual(
+                after_global["model_providers"]["custom"]["name"],
+                "custom",
+            )
+
+    def test_name_only_database_failure_rolls_back_database_and_global_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, settings_path, originals = make_database(root)
+            config_path = root / "config.toml"
+            original_global = global_config()
+            config_path.write_text(original_global, encoding="utf-8")
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "create trigger fail_provider_b before update on providers "
+                    "when new.id='provider-b' begin select raise(abort, 'injected'); end"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                MODULE.run_provider_name_migration(
+                    database,
+                    settings_path,
+                    config_path,
+                    MODULE.MigrationOptions(apply=True),
+                )
+
+            self.assertEqual(dict(provider_rows(database)), originals)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original_global)
+
+    def test_apply_synchronizes_one_global_model_policy_to_every_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             database, settings_path, originals = make_database(root)
@@ -187,7 +313,7 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
             self.assertEqual(preview["providerCount"], 3)
             self.assertEqual(preview["changedCount"], 3)
             self.assertTrue(preview["allAligned"])
-            self.assertEqual(preview["policy"]["modelFast"], "gpt-5.6-luna")
+            self.assertEqual(preview["policy"]["modelFast"], "gpt-5.6-sol")
 
             database_backup = root / "before.db"
             config_backup = root / "before.toml"
@@ -209,20 +335,14 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
                 config_path.read_text(encoding="utf-8")
             )
             self.assert_runtime_policy(synchronized_global, "fast")
-            expected_models = {
-                "provider-a": ("gpt-5.5", "gpt-5.6-luna"),
-                "provider-b": ("gpt-5.6-sol", "gpt-5.6-sol"),
-                "provider-c": ("gpt-5.6-sol", "gpt-5.6-luna"),
-            }
             for provider_id, raw_settings in provider_rows(database):
                 settings = json.loads(raw_settings)
                 config = MODULE.tomllib.loads(settings["config"])
-                expected_model, expected_model_fast = expected_models[provider_id]
                 self.assert_runtime_policy(
                     config,
                     "fast",
-                    model=expected_model,
-                    model_fast=expected_model_fast,
+                    model="gpt-5.6-sol",
+                    model_fast="gpt-5.6-sol",
                 )
                 self.assertEqual(
                     config["model_providers"]["custom"]["service_tier"],
@@ -245,7 +365,7 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
                 originals,
             )
 
-    def test_standard_removes_service_tier_and_preserves_provider_models(self) -> None:
+    def test_standard_removes_service_tier_and_keeps_one_global_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             database, settings_path, _ = make_database(root)
@@ -262,21 +382,73 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
                 tier="standard",
             )
             self.assertTrue(report["allAligned"])
-            expected_models = {
-                "provider-a": ("gpt-5.5", "gpt-5.6-luna"),
-                "provider-b": ("gpt-5.6-sol", "gpt-5.6-sol"),
-                "provider-c": ("gpt-5.6-luna", "gpt-5.6-luna"),
-            }
             for provider_id, raw_settings in provider_rows(database):
                 config = MODULE.tomllib.loads(json.loads(raw_settings)["config"])
-                expected_model, expected_model_fast = expected_models[provider_id]
                 self.assert_runtime_policy(
                     config,
                     "standard",
-                    model=expected_model,
-                    model_fast=expected_model_fast,
+                    model="gpt-5.6-luna",
+                    model_fast="gpt-5.6-luna",
                     reasoning_effort="low",
                 )
+
+    def test_existing_stale_global_fast_model_is_normalized_to_global_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, settings_path, _ = make_database(root)
+            config_path = root / "config.toml"
+            config_path.write_text(global_config(), encoding="utf-8")
+
+            report = MODULE.run_migration(
+                database,
+                settings_path,
+                config_path,
+                MODULE.MigrationOptions(apply=True),
+            )
+
+            self.assertTrue(report["allAligned"])
+            global_after = MODULE.tomllib.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(global_after["model"], "gpt-5.6-sol")
+            self.assertEqual(global_after["model_fast"], "gpt-5.6-sol")
+            for _, raw_settings in provider_rows(database):
+                config = MODULE.tomllib.loads(json.loads(raw_settings)["config"])
+                self.assertEqual(config["model"], "gpt-5.6-sol")
+                self.assertEqual(config["model_fast"], "gpt-5.6-sol")
+
+    def test_provider_projection_changes_only_live_route_and_global_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, settings_path, _ = make_database(root)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                global_config(display_name="old", model="gpt-5.6-luna", model_fast="gpt-5.6-sol"),
+                encoding="utf-8",
+            )
+
+            report = MODULE.run_migration(
+                database,
+                settings_path,
+                config_path,
+                MODULE.MigrationOptions(apply=True),
+                model="gpt-5.6-sol",
+                reasoning_effort="medium",
+                tier="fast",
+                provider_id="provider-a",
+            )
+
+            self.assertTrue(report["allAligned"])
+            live = MODULE.tomllib.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(live["model"], "gpt-5.6-sol")
+            self.assertEqual(live["model_fast"], "gpt-5.6-sol")
+            self.assertEqual(live["model_providers"]["custom"]["name"], "custom")
+            self.assertEqual(
+                live["model_providers"]["custom"]["base_url"],
+                "https://provider.example/v1",
+            )
+            for _, raw_settings in provider_rows(database):
+                stored = MODULE.tomllib.loads(json.loads(raw_settings)["config"])
+                self.assertEqual(stored["model"], "gpt-5.6-sol")
+                self.assertEqual(stored["model_fast"], "gpt-5.6-sol")
 
     def test_malformed_provider_aborts_without_partial_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -358,7 +530,7 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
         )
         policy = MODULE.RuntimePolicy(
             "gpt-5.6-sol",
-            "gpt-5.6-luna",
+            "gpt-5.6-sol",
             "medium",
             "fast",
         )
@@ -398,7 +570,7 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
         tier: str,
         *,
         model: str = "gpt-5.6-sol",
-        model_fast: str = "gpt-5.6-luna",
+            model_fast: str = "gpt-5.6-sol",
         reasoning_effort: str = "medium",
     ) -> None:
         self.assertEqual(config["model"], model)
@@ -410,6 +582,23 @@ class PersistCodexGlobalRuntimeTests(unittest.TestCase):
             self.assertEqual(config["service_tier"], "fast")
         else:
             self.assertNotIn("service_tier", config)
+
+    def provider_names(self, database: Path) -> dict[str, str]:
+        connection = sqlite3.connect(database)
+        try:
+            return dict(
+                connection.execute(
+                    "select id, name from providers where app_type='codex'"
+                ).fetchall()
+            )
+        finally:
+            connection.close()
+
+    def provider_settings(self, database: Path) -> dict[str, dict]:
+        return {
+            provider_id: json.loads(raw_settings)
+            for provider_id, raw_settings in provider_rows(database)
+        }
 
 
 if __name__ == "__main__":
