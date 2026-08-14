@@ -623,6 +623,9 @@ function New-TestCase {
     $fixtureHooks = @'
 {
   "hooks": {
+    "PreToolUse": [
+      {"matcher": "shell_command", "hooks": [{"type": "command", "command": "fixture-pre-tool-use"}]}
+    ],
     "SessionStart": [
       {"hooks": [{"type": "command", "command": "fixture-session-start-0"}]},
       {"hooks": [{"type": "command", "command": "fixture-session-start-1"}]}
@@ -641,6 +644,7 @@ function New-TestCase {
 '@
     $globalHooksPath = Join-Path $globalCodexRoot 'hooks.json'
     $fixtureHookKeys = @(
+        'pre_tool_use:0:0',
         'session_start:0:0',
         'session_start:1:0',
         'user_prompt_submit:0:0',
@@ -1655,11 +1659,13 @@ exit 1
         $localTrustPattern = "(?m)^\[hooks\.state\.'" +
             [regex]::Escape($materializedHooksPath) +
             ":[^']+'\]$"
-        Assert-Equal -Expected 5 -Actual ([regex]::Matches($materializedConfig, $localTrustPattern).Count) `
+        Assert-Equal -Expected 6 -Actual ([regex]::Matches($materializedConfig, $localTrustPattern).Count) `
             -Because 'every command hook must receive one run-local trusted hash'
         $materializedMetadata = Get-Content -Raw -LiteralPath (Join-Path $snapshot.codexHome 'run-provider.json') | ConvertFrom-Json
-        Assert-Equal -Expected 5 -Actual @($materializedMetadata.hookTrustByKey.PSObject.Properties).Count `
+        Assert-Equal -Expected 6 -Actual @($materializedMetadata.hookTrustByKey.PSObject.Properties).Count `
             -Because 'metadata must preserve the exact global trust map used by staged validation'
+        Assert-True -Condition ($null -ne $materializedMetadata.hookTrustByKey.PSObject.Properties['pre_tool_use:0:0']) `
+            -Because 'PreToolUse command hooks must be included in run-local trust validation'
         Assert-Equal -Expected (Get-Content -Raw -LiteralPath (Join-Path $case.UserRoot '.codex\hooks.json')) `
             -Actual (Get-Content -Raw -LiteralPath $materializedHooksPath) `
             -Because 'materialization must publish the exact hooks snapshot used for trust derivation'

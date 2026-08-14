@@ -242,6 +242,7 @@ from urllib.parse import urlparse
 
 
 EVENT_KEY_MAP = {
+    "PreToolUse": "pre_tool_use",
     "SessionStart": "session_start",
     "UserPromptSubmit": "user_prompt_submit",
     "Stop": "stop",
@@ -285,7 +286,9 @@ def collect_command_hook_keys(hook_groups):
     expected_keys = []
     for event_name, entries in hook_groups.items():
         event_key = EVENT_KEY_MAP.get(event_name)
-        if event_key is None or not isinstance(entries, list):
+        if event_key is None:
+            raise RuntimeError(f"Global hooks.json has unsupported event {event_name!r}.")
+        if not isinstance(entries, list):
             raise RuntimeError("Global hooks.json has an invalid event hook list.")
         for entry_index, entry in enumerate(entries):
             if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):

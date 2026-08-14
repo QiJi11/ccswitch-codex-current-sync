@@ -485,6 +485,7 @@ try:
     if metadata.get("mcpServerNames") != configured_mcp_names:
         raise RuntimeError("run-provider.json mcpServerNames does not match config.toml.")
     event_key_map = {
+        "PreToolUse": "pre_tool_use",
         "SessionStart": "session_start",
         "UserPromptSubmit": "user_prompt_submit",
         "Stop": "stop",
@@ -578,6 +579,7 @@ function Get-ConfiguredHookKeys {
     }
 
     $eventKeyMap = @{
+        PreToolUse = 'pre_tool_use'
         SessionStart = 'session_start'
         UserPromptSubmit = 'user_prompt_submit'
         Stop = 'stop'
