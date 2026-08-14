@@ -321,9 +321,23 @@ function Copy-ManagedFile {
 
 function Install-LauncherFiles {
     foreach ($scriptName in @(
+        'apply-browser-trust-overlay.py'
+        'browser-trust-overlay.ps1'
+        'ccswitch_config.py'
+        'ccswitch_credential_migration.py'
+        'ccswitch-credential-vault.ps1'
+        'codex-durable-config.ps1'
+        'get-ccswitch-provider-token.ps1'
+        'invoke-ccswitch-credential-migration.ps1'
         'invoke-ccswitch-codex.ps1'
         'materialize-ccswitch-codex-run.ps1'
         'persist-run-model.ps1'
+        'watch-run-model.ps1'
+        'powershell-host.ps1'
+        'remove-stale-ccswitch-data.ps1'
+        'resolve-ccswitch-root.ps1'
+        'restore-ccswitch-credential-rollback.ps1'
+        'sync-codex-durable-home.ps1'
         'sync-ccswitch-current-codex.ps1'
     )) {
         Copy-ManagedFile -SourcePath (Join-Path $PSScriptRoot $scriptName) -DestinationPath (Join-Path $BinDirectory $scriptName)

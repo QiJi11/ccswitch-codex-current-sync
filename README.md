@@ -1,18 +1,18 @@
 # ccswitch-codex-current-sync
 
-在 Windows 上把 CC Switch 当前选择的 Codex provider 固化成每次启动独立的 `CODEX_HOME`。已经运行的窗口不会被后续 provider 切换改写，正常退出时只把本窗口修改过的模型设置写回原 provider。
+在 Windows 上把 CC Switch 当前选择的 Codex provider 固化成每次启动独立的 `CODEX_HOME`。已经运行的窗口不会被后续 provider 切换改写；运行中选择的模型会及时写回原 provider，退出时还会再确认一次。
 
 ## 能解决什么
 
 - 每次启动创建独立 provider 快照，避免多个 Codex 窗口互相覆盖配置和认证。
 - 默认直接启动 Codex；Prodex 仅保留为显式回滚路径。
 - `resume` 复用原 session 所属的 run home。
-- 正常退出或 `Ctrl+C` 后，把变化过的 `model` 和 `model_reasoning_effort` 写回正确 provider。
+- 运行中或正常退出、`Ctrl+C` 后，把变化过的 `model` 和 `model_reasoning_effort` 写回正确 provider。
 - 为 PowerShell、无 profile PowerShell、CMD 和 Git Bash 提供统一入口。
-- 提供认证规范化、只读审计、历史 run home 保留和 provider 配置迁移工具。
+- 提供 DPAPI 凭据迁移、全普通文件已知令牌审计、耐久配置同步、历史 run home 保留和预览式清理工具。
 - 交互启动每 6 小时检查一次 Codex 稳定版；发现更新时提示，机器可读命令不插入提示。
 
-不支持运行中热切换。要采用 CC Switch 新选择的 provider，需要结束当前 Codex 后重新启动。
+不支持运行中热切换 provider。要采用 CC Switch 新选择的 provider，需要结束当前 Codex 后重新启动。
 
 ## 快速开始
 
@@ -47,7 +47,11 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\integration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\retention.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\provider-config-migration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-update-check.ps1
-python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\normalize-ccswitch-codex-auth.py
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\credential-migration.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\durable-sync.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\stale-cleanup.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\powershell-ast.ps1
+python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\ccswitch_config.py .\scripts\ccswitch_credential_migration.py
 git diff --check
 ```
 

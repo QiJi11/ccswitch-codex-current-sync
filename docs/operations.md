@@ -8,6 +8,7 @@
 - PowerShell 7 或 Windows PowerShell 5.1。
 - `python` 指向 Python 3.11 或更高版本。
 - `%USERPROFILE%\.codex\bin\codex-focusfixed-current.txt` 指向存在的 Codex 可执行文件。
+- `%USERPROFILE%\.codex\bin\codex-focusfixed-current.json` 与该指针一致，并记录已验证的 focus patch 元数据。
 
 默认 direct 模式不要求 Prodex。只有使用 `CCSWITCH_CODEX_LAUNCH_MODE=prodex` 回滚模式时，才要求 `prodex.ps1` 可从 npm 用户目录调用。
 
@@ -93,7 +94,11 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\integration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\retention.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\provider-config-migration.ps1
 pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\codex-update-check.ps1
-python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\normalize-ccswitch-codex-auth.py
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\credential-migration.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\durable-sync.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\stale-cleanup.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\tests\powershell-ast.ps1
+python -m py_compile .\scripts\audit-codex-provider-auth.py .\scripts\ccswitch_config.py .\scripts\ccswitch_credential_migration.py
 git diff --check
 ```
 

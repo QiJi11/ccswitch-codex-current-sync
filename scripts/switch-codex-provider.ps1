@@ -18,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $UserRoot = [Environment]::GetFolderPath('UserProfile')
+$DesktopCcSwitchRoot = Join-Path $env:APPDATA 'com.ccswitch.desktop'
 $LegacyCcSwitchRoot = Join-Path $UserRoot '.cc-switch'
 $ExplicitCcSwitchRoot = -not [string]::IsNullOrWhiteSpace($CcSwitchRoot)
 $DbPath = $null
@@ -26,6 +27,10 @@ $BackupDir = $null
 $ProdexRoot = Join-Path $env:USERPROFILE '.prodex'
 $SwitchStatePath = Join-Path $ProdexRoot 'codex-provider-switch-state.json'
 $ConfigPath = Join-Path $CurrentHome 'config.toml'
+$GlobalCodexHome = Join-Path $UserRoot '.codex'
+$GlobalConfigPath = Join-Path $GlobalCodexHome 'config.toml'
+$BrowserTrustPath = Join-Path $GlobalCodexHome 'browser-client-trust.json'
+$BrowserOverlayScript = Join-Path $ProdexRoot 'bin\apply-browser-trust-overlay.py'
 
 function Get-FullPathIfPossible {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -42,9 +47,11 @@ function Get-CandidateCcSwitchRoots {
     if ($ExplicitCcSwitchRoot) {
         $candidates.Add((Get-FullPathIfPossible -Path $CcSwitchRoot)) | Out-Null
     } else {
-        $full = Get-FullPathIfPossible -Path $LegacyCcSwitchRoot
-        if ($candidates -notcontains $full) {
-            $candidates.Add($full) | Out-Null
+        foreach ($root in @($DesktopCcSwitchRoot, $LegacyCcSwitchRoot)) {
+            $full = Get-FullPathIfPossible -Path $root
+            if ($candidates -notcontains $full) {
+                $candidates.Add($full) | Out-Null
+            }
         }
     }
 
@@ -60,7 +67,7 @@ function Set-ActiveCcSwitchRoot {
     $script:BackupDir = Join-Path $script:CcSwitchRoot 'backups'
 }
 
-Set-ActiveCcSwitchRoot -Root ($(if ($ExplicitCcSwitchRoot) { $CcSwitchRoot } else { $LegacyCcSwitchRoot }))
+Set-ActiveCcSwitchRoot -Root ($(if ($ExplicitCcSwitchRoot) { $CcSwitchRoot } else { $DesktopCcSwitchRoot }))
 
 function Write-SwitchInfo {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -455,7 +462,7 @@ function Resolve-ProviderForRequest {
 }
 
 function Sync-MirrorRootCurrentProvider {
-    param([Parameter(Mandatory = $true)][string]$ProviderId)
+    param([Parameter(Mandatory = $true)][string]$ProviderName)
 
     $primaryRoot = $CcSwitchRoot
     $results = New-Object System.Collections.Generic.List[object]
@@ -478,32 +485,25 @@ function Sync-MirrorRootCurrentProvider {
                 continue
             }
 
-            $state = Get-DbState
-            $matching = @($state.providers | Where-Object { [string]$_.id -eq $ProviderId })
-            if ($matching.Count -ne 1) {
-                $results.Add([pscustomobject]@{
-                    root    = $CcSwitchRoot
-                    status  = 'skipped'
-                    message = 'provider id not present'
-                }) | Out-Null
-                continue
-            }
+            $mirrorProvider = (Resolve-Provider -ProviderText $ProviderName).provider
 
-            if (Test-DbSettingsConsistent -ProviderDetails $matching[0]) {
+            if (Test-DbSettingsConsistent -ProviderDetails $mirrorProvider) {
                 $results.Add([pscustomobject]@{
-                    root    = $CcSwitchRoot
-                    status  = 'unchanged'
-                    message = 'already selected'
+                    root       = $CcSwitchRoot
+                    providerId = [string]$mirrorProvider.id
+                    status     = 'unchanged'
+                    message    = 'already selected'
                 }) | Out-Null
                 continue
             }
 
             $dbBackupPath = New-UniqueBackupPath -Directory $BackupDir -Leaf "cc-switch.db.bak-mirror-$stamp"
             $settingsBackupPath = New-UniqueBackupPath -Directory $BackupDir -Leaf "settings.json.bak-mirror-$stamp"
-            Set-DbCurrentProvider -ProviderId $ProviderId -BackupPath $dbBackupPath | Out-Null
-            Set-SettingsCurrentProvider -ProviderId $ProviderId -BackupPath $settingsBackupPath
+            Set-DbCurrentProvider -ProviderId ([string]$mirrorProvider.id) -BackupPath $dbBackupPath | Out-Null
+            Set-SettingsCurrentProvider -ProviderId ([string]$mirrorProvider.id) -BackupPath $settingsBackupPath
             $results.Add([pscustomobject]@{
                 root               = $CcSwitchRoot
+                providerId         = [string]$mirrorProvider.id
                 status             = 'updated'
                 message            = 'mirrored current provider'
                 dbBackupPath       = $dbBackupPath
@@ -586,7 +586,7 @@ function Invoke-Materialize {
     if (-not (Test-Path -LiteralPath $MaterializeScript)) {
         throw "Missing materialize script: $MaterializeScript"
     }
-    $output = @(& $MaterializeScript -CcSwitchRoot $CcSwitchRoot -Quiet 2>&1 | ForEach-Object { [string]$_ })
+    $output = @(& $MaterializeScript -CcSwitchRoot $CcSwitchRoot -LaunchMode direct -Quiet 2>&1 | ForEach-Object { [string]$_ })
     if ($LASTEXITCODE -ne 0) {
         throw "materialize failed with exit code $LASTEXITCODE`: $($output -join ' | ')"
     }
@@ -615,6 +615,76 @@ function Invoke-CurrentSync {
     return @($output)
 }
 
+function Sync-GlobalBrowserRuntime {
+    foreach ($requiredPath in @($ConfigPath, $GlobalConfigPath, $BrowserTrustPath, $BrowserOverlayScript)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "Missing Browser runtime merge input: $requiredPath"
+        }
+    }
+    $python = (Get-Command python -ErrorAction Stop).Source
+    $temporaryPath = "$GlobalConfigPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
+    $restorePath = "$GlobalConfigPath.restore-$PID-$([guid]::NewGuid().ToString('N'))"
+    $sourceConfig = Get-TextFileContent -Path $GlobalConfigPath
+    $published = $false
+    try {
+        & $python $BrowserOverlayScript `
+            --trust-file $BrowserTrustPath `
+            --input $GlobalConfigPath `
+            --output $temporaryPath `
+            --runtime-source $ConfigPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Global Browser runtime merge failed with exit code $LASTEXITCODE."
+        }
+        if (-not [string]::Equals((Get-TextFileContent -Path $GlobalConfigPath), $sourceConfig, [StringComparison]::Ordinal)) {
+            throw 'Global config changed while preparing the Browser runtime merge.'
+        }
+        $merged = Get-TextFileContent -Path $temporaryPath
+        if ([string]::Equals($sourceConfig, $merged, [StringComparison]::Ordinal)) {
+            return [pscustomobject]@{ Changed = $false }
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $GlobalConfigPath -Force
+        $published = $true
+        if (-not [string]::Equals((Get-TextFileContent -Path $GlobalConfigPath), $merged, [StringComparison]::Ordinal)) {
+            throw 'Global Browser runtime merge verification failed.'
+        }
+        return [pscustomobject]@{ Changed = $true }
+    } catch {
+        if ($published) {
+            [System.IO.File]::WriteAllText($restorePath, $sourceConfig, [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $restorePath -Destination $GlobalConfigPath -Force
+        }
+        throw
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath, $restorePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-CompletedBackup {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $allowed = @(
+        Get-CandidateCcSwitchRoots | ForEach-Object {
+            [System.IO.Path]::GetFullPath((Join-Path $_ 'backups')).TrimEnd('\', '/') + '\'
+        }
+    )
+    if (@($allowed | Where-Object {
+        $fullPath.StartsWith($_, [StringComparison]::OrdinalIgnoreCase)
+    }).Count -ne 1) {
+        throw "Refusing to remove a switch backup outside known backup roots: $fullPath"
+    }
+    try {
+        Remove-Item -LiteralPath $fullPath -Force
+        return $true
+    } catch {
+        Write-SwitchInfo "Unable to remove completed switch backup: $fullPath"
+        return $false
+    }
+}
+
 function Write-SwitchState {
     param(
         [Parameter(Mandatory = $true)]$ProviderDetails,
@@ -641,8 +711,7 @@ function Write-SwitchState {
 }
 
 $mutexName = 'Global\switch-codex-provider'
-$createdNew = $false
-$mutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew)
+$mutex = [System.Threading.Mutex]::new($false, $mutexName)
 $hasMutex = $false
 
 $result = [ordered]@{
@@ -662,6 +731,7 @@ $result = [ordered]@{
     materializedHome = $null
     baseUrl = $null
     syncOutput = @()
+    globalBrowserRuntimeChanged = $false
     rollback = $null
     message = ''
 }
@@ -708,7 +778,7 @@ try {
         Write-SwitchInfo ("selected provider={0} id={1} root={2}" -f $target.name, $target.id, $CcSwitchRoot)
     }
 
-    $result.mirrors = @(Sync-MirrorRootCurrentProvider -ProviderId ([string]$target.id))
+    $result.mirrors = @(Sync-MirrorRootCurrentProvider -ProviderName ([string]$target.name))
 
     $materialize = Invoke-Materialize
     $result.materializedProfile = [string]$materialize.Metadata.profileName
@@ -716,12 +786,34 @@ try {
 
     $syncOutput = @(Invoke-CurrentSync)
     $result.syncOutput = @($syncOutput)
+    $globalBrowserRuntime = Sync-GlobalBrowserRuntime
+    $result.globalBrowserRuntimeChanged = [bool]$globalBrowserRuntime.Changed
 
     if (-not (Test-ProviderConsistent -ProviderDetails $target)) {
         throw 'Post-switch verification failed: DB, settings.json, or ccswitch-current base_url is inconsistent.'
     }
 
-    Write-SwitchState -ProviderDetails $target -Materialized $materialize.Metadata -DbBackupPath $dbBackupPath -SettingsBackupPath $settingsBackupPath
+    $stateDbBackupPath = if (Remove-CompletedBackup -Path $dbBackupPath) { $null } else { $dbBackupPath }
+    $stateSettingsBackupPath = if (Remove-CompletedBackup -Path $settingsBackupPath) { $null } else { $settingsBackupPath }
+    $result.dbBackupPath = $stateDbBackupPath
+    $result.settingsBackupPath = $stateSettingsBackupPath
+    foreach ($mirror in @($result.mirrors)) {
+        if ($mirror.PSObject.Properties['dbBackupPath']) {
+            if (Remove-CompletedBackup -Path ([string]$mirror.dbBackupPath)) {
+                $mirror.dbBackupPath = $null
+            }
+        }
+        if ($mirror.PSObject.Properties['settingsBackupPath']) {
+            if (Remove-CompletedBackup -Path ([string]$mirror.settingsBackupPath)) {
+                $mirror.settingsBackupPath = $null
+            }
+        }
+    }
+    Write-SwitchState `
+        -ProviderDetails $target `
+        -Materialized $materialize.Metadata `
+        -DbBackupPath $stateDbBackupPath `
+        -SettingsBackupPath $stateSettingsBackupPath
     $result.ok = $true
     $result.message = 'provider switched'
 
@@ -751,6 +843,7 @@ try {
             }
             try {
                 Invoke-CurrentSync | Out-Null
+                Sync-GlobalBrowserRuntime | Out-Null
             } catch {
                 $rollbackInfo.message = "provider restored, but current-home sync failed: $_"
             }

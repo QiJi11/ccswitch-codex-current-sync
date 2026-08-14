@@ -51,7 +51,20 @@ if (-not (Test-Path -LiteralPath $ScriptPath)) {
 
 $binDir = Join-Path $env:USERPROFILE '.prodex\bin'
 New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-foreach ($scriptName in @('switch-codex-provider.ps1', 'materialize-ccswitch-codex-run.ps1', 'sync-ccswitch-current-codex.ps1')) {
+foreach ($scriptName in @(
+    'apply-browser-trust-overlay.py',
+    'browser-trust-overlay.ps1',
+    'ccswitch_config.py',
+    'ccswitch-credential-vault.ps1',
+    'codex-durable-config.ps1',
+    'get-ccswitch-provider-token.ps1',
+    'materialize-ccswitch-codex-run.ps1',
+    'powershell-host.ps1',
+    'resolve-ccswitch-root.ps1',
+    'switch-codex-provider.ps1',
+    'sync-codex-durable-home.ps1',
+    'sync-ccswitch-current-codex.ps1'
+)) {
     $source = Join-Path $PSScriptRoot $scriptName
     $target = Join-Path $binDir $scriptName
     if (-not (Test-Path -LiteralPath $source)) {

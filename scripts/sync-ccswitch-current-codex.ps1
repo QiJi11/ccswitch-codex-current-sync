@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$CcSwitchRoot = (Join-Path $env:USERPROFILE '.cc-switch'),
+    [string]$CcSwitchRoot = '',
     [string[]]$CodexHome = @(),
     [switch]$CheckOnly,
     [switch]$Quiet
@@ -9,21 +9,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+. (Join-Path $PSScriptRoot 'resolve-ccswitch-root.ps1')
+. (Join-Path $PSScriptRoot 'browser-trust-overlay.ps1')
+. (Join-Path $PSScriptRoot 'codex-durable-config.ps1')
 
-$prodexRoot = if ([string]::IsNullOrWhiteSpace($env:PRODEX_HOME)) {
-    Join-Path $env:USERPROFILE '.prodex'
-} else {
-    [System.IO.Path]::GetFullPath($env:PRODEX_HOME)
-}
 $CodexHomes = @($CodexHome | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+$globalCodex = [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.codex'))
 if ($CodexHomes.Count -eq 0) {
-    $prodexCurrent = Join-Path $prodexRoot 'manual-homes\ccswitch-current'
-    if (Test-Path -LiteralPath $prodexCurrent) {
-        $CodexHomes = @($prodexCurrent)
-    } else {
-        $CodexHomes = @(Join-Path $env:USERPROFILE '.codex')
-    }
+    $CodexHomes = @(Join-Path $env:USERPROFILE '.prodex\manual-homes\ccswitch-current')
 }
+$CodexHomes = @($CodexHomes | ForEach-Object { [System.IO.Path]::GetFullPath($_) } | Select-Object -Unique)
+if (@($CodexHomes | Where-Object {
+    [string]::Equals($_, $globalCodex, [StringComparison]::OrdinalIgnoreCase)
+}).Count -gt 0) {
+    throw 'Refusing to sync a third-party provider into the global Codex home.'
+}
+$CcSwitchRoot = Resolve-CcSwitchRoot -ExplicitRoot $CcSwitchRoot -UserRoot $env:USERPROFILE -AppDataRoot $env:APPDATA
 
 $SettingsPath = Join-Path $CcSwitchRoot 'settings.json'
 $DbPath = Join-Path $CcSwitchRoot 'cc-switch.db'
@@ -76,10 +77,16 @@ try:
 finally:
     connection.close()
 '@
-    $global:LASTEXITCODE = 0
-    $output = @(& $pythonCommand.Source -c $pythonCode $DbPath)
-    if ($LASTEXITCODE -ne 0) {
-        throw "cc-switch current-provider verification failed with exit code $LASTEXITCODE."
+    $scriptPath = Join-Path ([System.IO.Path]::GetTempPath()) "verify-ccswitch-current-$PID-$([guid]::NewGuid().ToString('N')).py"
+    try {
+        [System.IO.File]::WriteAllText($scriptPath, $pythonCode, [System.Text.UTF8Encoding]::new($false))
+        $global:LASTEXITCODE = 0
+        $output = @(& $pythonCommand.Source $scriptPath $DbPath)
+        if ($LASTEXITCODE -ne 0) {
+            throw "cc-switch current-provider verification failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
     }
     $result = (($output | Out-String).Trim()) | ConvertFrom-Json
     $ids = @($result.ids)
@@ -104,40 +111,18 @@ function Write-Utf8NoBom {
     }
 }
 
-function New-BackupPath {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Stamp
-    )
-
-    $candidate = "$Path.bak-$Stamp"
-    $index = 1
-    while (Test-Path -LiteralPath $candidate) {
-        $candidate = "$Path.bak-$Stamp-$index"
-        $index++
-    }
-    return $candidate
-}
-
 function Sync-TextFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DesiredContent,
-        [Parameter(Mandatory = $true)][string]$Stamp
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$DesiredContent
     )
 
     if (Test-Path -LiteralPath $Path) {
         $existing = Get-TextFileContent -Path $Path
         if ([string]::Equals($existing, $DesiredContent, [StringComparison]::Ordinal)) {
-            return [pscustomobject]@{ Path = $Path; Changed = $false; BackupPath = $null }
+            return [pscustomobject]@{ Path = $Path; Changed = $false }
         }
 
-        $backupPath = New-BackupPath -Path $Path -Stamp $Stamp
-        if (-not $CheckOnly) {
-            Copy-Item -LiteralPath $Path -Destination $backupPath -Force
-        }
-    } else {
-        $backupPath = $null
     }
 
     if (-not $CheckOnly) {
@@ -148,7 +133,7 @@ function Sync-TextFile {
         }
     }
 
-    return [pscustomobject]@{ Path = $Path; Changed = $true; BackupPath = $backupPath }
+    return [pscustomobject]@{ Path = $Path; Changed = $true }
 }
 
 if (-not (Test-Path -LiteralPath $SettingsPath)) {
@@ -244,7 +229,7 @@ if len(active_rows) != 1 or active_rows[0]["id"] != provider_id:
     )
 
 row = cur.execute(
-    "select id, name, website_url, settings_config from providers where app_type='codex' and id=?",
+    "select id, name, website_url, category, settings_config from providers where app_type='codex' and id=?",
     (provider_id,),
 ).fetchone()
 if row is None:
@@ -269,6 +254,7 @@ result = {
         "id": row["id"],
         "name": row["name"],
         "websiteUrl": row["website_url"],
+        "category": row["category"],
         "baseUrl": base_url,
         "baseHost": urlparse(base_url).netloc if base_url else None,
     },
@@ -334,32 +320,64 @@ if (-not [string]::Equals($currentProviderId, $currentProviderAfter, [StringComp
     throw 'cc-switch provider selection changed while capturing the mirror snapshot.'
 }
 
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$durableParameters = @{
+    ProviderConfigText = [string]$details.config
+    SelectionConfigText = [string]$details.config
+    ProviderId = [string]$details.provider.id
+    GlobalConfigPath = Join-Path $globalCodex 'config.toml'
+}
+if ([string]$details.provider.category -eq 'official') {
+    $durableParameters.OfficialProvider = $true
+}
+$durableConfig = Get-CcSwitchDurableConfig @durableParameters
+$browserTrustOverlay = Get-BrowserTrustOverlay -ConfigText $durableConfig
+$effectiveConfig = [string]$browserTrustOverlay.ConfigText
+$effectiveConfigSha256 = [string]$browserTrustOverlay.ConfigSha256
+$hasDrift = $false
 foreach ($targetHome in $CodexHomes) {
     if (-not $CheckOnly) {
         New-Item -ItemType Directory -Path $targetHome -Force | Out-Null
     }
     $configResult = Sync-TextFile `
         -Path (Join-Path $targetHome 'config.toml') `
-        -DesiredContent ([string]$details.config) `
-        -Stamp $stamp
+        -DesiredContent $effectiveConfig
     $authResult = Sync-TextFile `
         -Path (Join-Path $targetHome 'auth.json') `
-        -DesiredContent ([string]$details.authJson) `
-        -Stamp $stamp
+        -DesiredContent ([string]$details.authJson)
 
-    Write-SyncInfo ("ccswitch-current home={0} provider={1} id={2} config_sha256={3} auth_sha256={4}" -f `
-        $targetHome, $details.provider.name, $details.provider.id, $details.configSha256, $details.authSha256)
+    $durableScript = Join-Path $PSScriptRoot 'sync-codex-durable-home.ps1'
+    $pwsh = Get-CurrentPowerShellExecutable
+    $durableArguments = @(
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $durableScript,
+        '-TargetHome', $targetHome,
+        '-Mode', 'Current',
+        '-GlobalCodexHome', $globalCodex,
+        '-Quiet', '-Json', '-NoExit'
+    )
+    if ($CheckOnly) { $durableArguments += '-CheckOnly' }
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $durableOutput = @(& $pwsh @durableArguments)
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    $durableExitCode = $LASTEXITCODE
+    if ($durableExitCode -notin @(0, 2)) {
+        throw "Durable current-home sync failed with exit code $durableExitCode."
+    }
+    $durableReport = (($durableOutput | Out-String).Trim() | ConvertFrom-Json)
+    $hasDrift = $hasDrift -or $configResult.Changed -or $authResult.Changed -or [bool]$durableReport.changed
+
+    Write-SyncInfo ("isolated home={0} provider={1} id={2} config_sha256={3} auth_sha256={4}" -f `
+        $targetHome, $details.provider.name, $details.provider.id, $effectiveConfigSha256, $details.authSha256)
 
     foreach ($result in @($configResult, $authResult)) {
         $leaf = Split-Path -Leaf $result.Path
         if ($result.Changed) {
             $action = if ($CheckOnly) { 'would update' } else { 'updated' }
-            if ($null -eq $result.BackupPath) {
-                Write-SyncInfo ("{0} {1} backup=<none-existing-file>" -f $leaf, $action)
-            } else {
-                Write-SyncInfo ("{0} {1} backup={2}" -f $leaf, $action, $result.BackupPath)
-            }
+            Write-SyncInfo ("{0} {1}" -f $leaf, $action)
         } else {
             Write-SyncInfo ("{0} unchanged" -f $leaf)
         }
@@ -371,4 +389,7 @@ $databaseProviderFinal = Get-DatabaseCurrentProviderId
 if ((-not [string]::Equals([string]$details.provider.id, $currentProviderFinal, [StringComparison]::Ordinal)) -or
     (-not [string]::Equals([string]$details.provider.id, $databaseProviderFinal, [StringComparison]::Ordinal))) {
     throw 'cc-switch provider selection changed while updating the current-provider mirrors.'
+}
+if ($CheckOnly -and $hasDrift) {
+    exit 2
 }

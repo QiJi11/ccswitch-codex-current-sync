@@ -11,6 +11,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve-ccswitch-root.ps1')
+. (Join-Path $PSScriptRoot 'browser-trust-overlay.ps1')
+. (Join-Path $PSScriptRoot 'codex-durable-config.ps1')
 
 $UserRoot = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     [Environment]::GetFolderPath('UserProfile')
@@ -21,11 +24,7 @@ if ([string]::IsNullOrWhiteSpace($UserRoot)) {
     throw 'Unable to resolve the user profile directory.'
 }
 
-if ([string]::IsNullOrWhiteSpace($CcSwitchRoot)) {
-    $CcSwitchRoot = Join-Path $UserRoot '.cc-switch'
-} else {
-    $CcSwitchRoot = [System.IO.Path]::GetFullPath($CcSwitchRoot)
-}
+$CcSwitchRoot = Resolve-CcSwitchRoot -ExplicitRoot $CcSwitchRoot -UserRoot $UserRoot -AppDataRoot $env:APPDATA
 $ProdexRoot = if ([string]::IsNullOrWhiteSpace($env:PRODEX_HOME)) {
     Join-Path $UserRoot '.prodex'
 } else {
@@ -45,8 +44,7 @@ if ([string]::IsNullOrWhiteSpace($ProdexScript)) {
 }
 $RunHomesRoot = Join-Path $ProdexRoot 'manual-homes\ccswitch-runs'
 $CurrentHome = Join-Path $ProdexRoot 'manual-homes\ccswitch-current'
-$CurrentSkillsRoot = Join-Path $CurrentHome 'skills'
-$GlobalSkillsRoot = Join-Path $GlobalCodexRoot 'skills'
+$DurableSyncScript = Join-Path $PSScriptRoot 'sync-codex-durable-home.ps1'
 
 function ConvertTo-SafeName {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -324,55 +322,6 @@ function Register-ProdexProfile {
     }
 }
 
-function Add-SkillEntry {
-    param(
-        [Parameter(Mandatory = $true)][string]$TargetRoot,
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][string]$SourceRoot
-    )
-
-    $source = Join-Path $SourceRoot $Name
-    if (-not (Test-Path -LiteralPath $source)) {
-        Write-Info "skill source missing, skipped: $source"
-        return
-    }
-
-    New-Item -ItemType Directory -Path $TargetRoot -Force | Out-Null
-    $target = Join-Path $TargetRoot $Name
-    if (Test-Path -LiteralPath $target) {
-        return
-    }
-
-    try {
-        New-Item -ItemType Junction -Path $target -Target $source -ErrorAction Stop | Out-Null
-    } catch {
-        Copy-Item -LiteralPath $source -Destination $target -Recurse -Force
-    }
-}
-
-function Initialize-CodexHomeRulesAndSkills {
-    param([Parameter(Mandatory = $true)][string]$CodexHomePath)
-
-    $agentsSource = Join-Path $CurrentHome 'AGENTS.md'
-    if (-not (Test-Path -LiteralPath $agentsSource)) { throw "Missing current AGENTS.md: $agentsSource" }
-    Copy-Item -LiteralPath $agentsSource -Destination (Join-Path $CodexHomePath 'AGENTS.md') -Force
-
-    $skillsTarget = Join-Path $CodexHomePath 'skills'
-    New-Item -ItemType Directory -Path $skillsTarget -Force | Out-Null
-
-    foreach ($skill in @('.system', 'documents', 'presentations', 'spreadsheets')) {
-        if (Test-Path -LiteralPath (Join-Path $CurrentSkillsRoot $skill)) {
-            Add-SkillEntry -TargetRoot $skillsTarget -Name $skill -SourceRoot $CurrentSkillsRoot
-        } else {
-            Add-SkillEntry -TargetRoot $skillsTarget -Name $skill -SourceRoot $GlobalSkillsRoot
-        }
-    }
-
-    foreach ($skill in @('accuracy-gate', 'prompt-sensei', 'clean-code-guard', 'docs-guard', 'test-guard', 'pict-test-designer')) {
-        Add-SkillEntry -TargetRoot $skillsTarget -Name $skill -SourceRoot $GlobalSkillsRoot
-    }
-}
-
 function Get-VerifiedRunChildPath {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -486,7 +435,63 @@ else:
     }
 }
 
+function Sync-CurrentHomeSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot,
+        [Parameter(Mandatory = $true)][string]$ConfigText
+    )
+
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\CcSwitchCurrentMirrorSync-v1')
+    $lockHeld = $false
+    try {
+        $lockHeld = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+        if (-not $lockHeld) {
+            throw 'Timed out waiting to update ccswitch-current.'
+        }
+        $confirmed = Get-StableCcSwitchSnapshot
+        if (-not [string]::Equals([string]$Snapshot.provider.id, [string]$confirmed.provider.id, [StringComparison]::Ordinal) -or
+            -not [string]::Equals([string]$Snapshot.configSha256, [string]$confirmed.configSha256, [StringComparison]::Ordinal) -or
+            -not [string]::Equals([string]$Snapshot.authSha256, [string]$confirmed.authSha256, [StringComparison]::Ordinal)) {
+            throw 'CC Switch provider snapshot changed before ccswitch-current could be updated.'
+        }
+        [System.IO.Directory]::CreateDirectory($CurrentHome) | Out-Null
+        Write-Utf8NoBom -Path (Join-Path $CurrentHome 'config.toml') -Content $ConfigText
+        Write-Utf8NoBom -Path (Join-Path $CurrentHome 'auth.json') -Content ([string]$Snapshot.authJson)
+        & $DurableSyncScript -TargetHome $CurrentHome -Mode Current -GlobalCodexHome $GlobalCodexRoot -Quiet
+        if ($LASTEXITCODE -notin @($null, 0)) {
+            throw "Durable current-home sync failed with exit code $LASTEXITCODE."
+        }
+        $publishedConfig = Get-TextFileContent -Path (Join-Path $CurrentHome 'config.toml')
+        $publishedAuth = Get-TextFileContent -Path (Join-Path $CurrentHome 'auth.json')
+        if (-not [string]::Equals($publishedConfig, $ConfigText, [StringComparison]::Ordinal) -or
+            -not [string]::Equals($publishedAuth, [string]$Snapshot.authJson, [StringComparison]::Ordinal)) {
+            throw 'ccswitch-current verification failed after snapshot publication.'
+        }
+    } finally {
+        if ($lockHeld) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
 $details = Get-StableCcSwitchSnapshot
+$durableParameters = @{
+    ProviderConfigText = [string]$details.config
+    SelectionConfigText = [string]$details.config
+    ProviderId = [string]$details.provider.id
+    GlobalConfigPath = Join-Path $GlobalCodexRoot 'config.toml'
+}
+if ([string]$details.provider.category -eq 'official') {
+    $durableParameters.OfficialProvider = $true
+}
+$durableConfig = Get-CcSwitchDurableConfig @durableParameters
+$globalRuntimeConfigPath = Join-Path $GlobalCodexRoot 'config.toml'
+$browserTrustOverlay = Get-BrowserTrustOverlay `
+    -ConfigText $durableConfig `
+    -RuntimeSourcePath $globalRuntimeConfigPath
+$effectiveConfig = [string]$browserTrustOverlay.ConfigText
+$effectiveConfigSha256 = [string]$browserTrustOverlay.ConfigSha256
 $safeProviderId = ConvertTo-SafeName -Value ([string]$details.provider.id)
 $runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runSuffix = [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -503,10 +508,12 @@ $metadata = [pscustomobject]@{
     prodexHome = $runProdexHome
     providerId = $details.provider.id
     providerName = $details.provider.name
+    providerCategory = $details.provider.category
+    ccSwitchRoot = $CcSwitchRoot
     baseUrl = $details.provider.baseUrl
     baseHost = $details.provider.baseHost
     endpointHost = $details.provider.endpointHost
-    configSha256 = $details.configSha256
+    configSha256 = $effectiveConfigSha256
     authSha256 = $details.authSha256
     model = $details.model
     modelReasoningEffort = $details.modelReasoningEffort
@@ -519,15 +526,18 @@ $published = $false
 $runtimeReady = $false
 try {
     New-Item -ItemType Directory -Path $stagingHome -ErrorAction Stop | Out-Null
-    Write-Utf8NoBom -Path (Join-Path $stagingHome 'config.toml') -Content ([string]$details.config)
+    Write-Utf8NoBom -Path (Join-Path $stagingHome 'config.toml') -Content $effectiveConfig
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'auth.json') -Content ([string]$details.authJson)
-    Initialize-CodexHomeRulesAndSkills -CodexHomePath $stagingHome
+    & $DurableSyncScript -TargetHome $stagingHome -Mode Run -GlobalCodexHome $GlobalCodexRoot -Quiet
+    if ($LASTEXITCODE -notin @($null, 0)) {
+        throw "Durable run-home sync failed with exit code $LASTEXITCODE."
+    }
     Write-Utf8NoBom -Path (Join-Path $stagingHome 'run-provider.json') -Content (($metadata | ConvertTo-Json -Depth 8) + "`n")
     Test-StagedCodexHome `
         -StagingHome $stagingHome `
         -FinalHome $codexHome `
         -ProviderId ([string]$details.provider.id) `
-        -ConfigSha256 ([string]$details.configSha256) `
+        -ConfigSha256 $effectiveConfigSha256 `
         -AuthSha256 ([string]$details.authSha256)
 
     $verifiedStagingHome = Get-VerifiedRunChildPath -Path $stagingHome -ExpectedName $stagingName
@@ -535,6 +545,8 @@ try {
     if (Test-Path -LiteralPath $verifiedCodexHome) { throw "Final run home already exists: $verifiedCodexHome" }
     [System.IO.Directory]::Move($verifiedStagingHome, $verifiedCodexHome)
     $published = $true
+
+    Sync-CurrentHomeSnapshot -Snapshot $details -ConfigText $effectiveConfig
 
     if ($LaunchMode -eq 'prodex') {
         Register-ProdexProfile `

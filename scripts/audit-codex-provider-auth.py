@@ -3,6 +3,7 @@ import json
 import sqlite3
 import sys
 import tomllib
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,6 +55,15 @@ def third_party_issues(model_provider: object, provider: dict, parsed_url) -> li
         issues.append("third-party provider incorrectly requires OpenAI auth")
     if provider.get("wire_api") not in (None, "responses"):
         issues.append("active provider wire_api is not responses")
+    command_auth = provider.get("auth")
+    if isinstance(command_auth, dict) and command_auth.get("command"):
+        incompatible = {
+            key
+            for key in ("env_key", "experimental_bearer_token", "requires_openai_auth")
+            if key in provider
+        }
+        if incompatible:
+            issues.append("command authentication is combined with incompatible provider keys")
     return issues
 
 
@@ -72,16 +82,29 @@ def provider_summary(row: sqlite3.Row, settings: dict, config: dict) -> dict[str
     top_level_bearer = config.get("experimental_bearer_token")
     base_url = provider.get("base_url")
     parsed_url = urlparse(base_url) if isinstance(base_url, str) else None
-    issues = authentication_issues(row["category"], auth, auth_api_key, bearer_token or top_level_bearer)
+    issues = authentication_issues(
+        row["category"],
+        auth,
+        auth_api_key,
+        bearer_token or top_level_bearer,
+        provider.get("auth"),
+    )
     if row["category"] != "official":
         issues.extend(third_party_issues(model_provider, provider, parsed_url))
     return provider_report(row, settings, config, issues)
 
 
-def authentication_issues(category: object, auth: dict, api_key: object, bearer: object) -> list[str]:
+def authentication_issues(
+    category: object,
+    auth: dict,
+    api_key: object,
+    bearer: object,
+    command_auth: object,
+) -> list[str]:
     if category == "official":
         return [] if auth.get("tokens") or api_key else ["official provider has no stored login material"]
-    return [] if api_key or bearer else ["third-party provider has no API key or bearer token"]
+    command_backed = isinstance(command_auth, dict) and bool(command_auth.get("command"))
+    return [] if api_key or bearer or command_backed else ["third-party provider has no supported authentication"]
 
 
 def provider_route(config: dict) -> tuple[object, dict, object]:
@@ -115,6 +138,9 @@ def authentication_report(settings: dict, config: dict) -> dict[str, object]:
         "storedBearerDigest": digest(bearer_token),
         "authMode": auth.get("auth_mode"),
         "hasChatGptTokens": bool(auth.get("tokens")),
+        "commandBacked": bool(
+            isinstance(provider.get("auth"), dict) and provider["auth"].get("command")
+        ),
     }
 
 
@@ -142,7 +168,7 @@ def audit_provider(row: sqlite3.Row) -> dict[str, object]:
 
 def provider_rows(database: Path) -> list[sqlite3.Row]:
     uri = database.as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+    with closing(sqlite3.connect(uri, uri=True)) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             "select id, name, category, is_current, settings_config "

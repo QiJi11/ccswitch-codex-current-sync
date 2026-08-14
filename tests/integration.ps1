@@ -174,9 +174,7 @@ def provider_settings(provider_id, model, effort):
     return json.dumps(
         {
             "config": config,
-            "auth": {
-                "OPENAI_API_KEY": f"TEST_TOKEN_{provider_id.upper().replace('-', '_')}",
-            },
+            "auth": {},
             "fixtureMarker": provider_id,
         },
         ensure_ascii=True,
@@ -444,6 +442,7 @@ function New-TestCase {
     $currentHome = Join-Path $prodexRoot 'manual-homes\ccswitch-current'
     $runHomesRoot = Join-Path $prodexRoot 'manual-homes\ccswitch-runs'
     $sharedCodexHome = Join-Path $root 'shared-codex'
+    $globalCodexHome = Join-Path $userRoot '.codex'
     $ccSwitchRoot = Join-Path $userRoot '.cc-switch'
 
     foreach ($directory in @(
@@ -451,11 +450,17 @@ function New-TestCase {
         (Join-Path $currentHome 'skills'),
         (Split-Path -Parent $runHomesRoot),
         $sharedCodexHome,
+        (Join-Path $globalCodexHome 'agents'),
+        (Join-Path $globalCodexHome 'skills'),
         $ccSwitchRoot
     )) {
         [IO.Directory]::CreateDirectory($directory) | Out-Null
     }
     Write-Utf8NoBom -Path (Join-Path $currentHome 'AGENTS.md') -Content "# Fixture rules`n"
+    Write-Utf8NoBom -Path (Join-Path $globalCodexHome 'AGENTS.md') -Content "# Fixture rules`n"
+    Write-Utf8NoBom -Path (Join-Path $globalCodexHome 'config.toml') -Content "approval_policy = 'never'`n"
+    Write-Utf8NoBom -Path (Join-Path $globalCodexHome 'browser-client-trust.json') `
+        -Content '{"schemaVersion":1,"trustedBrowserClientSha256":["0000000000000000000000000000000000000000000000000000000000000000"]}'
     $case = [pscustomobject]@{
         Name = $Name
         Root = $root
@@ -645,6 +650,7 @@ function Start-CapturedProcess {
         [AllowNull()][string]$StandardInput = $null
     )
 
+    $redirectStandardInput = $PSBoundParameters.ContainsKey('StandardInput')
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $FilePath
     $startInfo.WorkingDirectory = $WorkingDirectory
@@ -652,12 +658,21 @@ function Start-CapturedProcess {
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
-    $startInfo.RedirectStandardInput = $null -ne $StandardInput
-    foreach ($argument in $Arguments) {
-        $startInfo.ArgumentList.Add($argument)
+    $startInfo.RedirectStandardInput = $redirectStandardInput
+    if ($startInfo.PSObject.Properties.Name -contains 'ArgumentList') {
+        foreach ($argument in $Arguments) {
+            $startInfo.ArgumentList.Add($argument)
+        }
+    } else {
+        $quotedArguments = @($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Argument $_ })
+        $startInfo.Arguments = $quotedArguments -join ' '
     }
     foreach ($entry in $Environment.GetEnumerator()) {
-        $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+        if ($startInfo.PSObject.Properties.Name -contains 'Environment') {
+            $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+        } else {
+            $startInfo.EnvironmentVariables[[string]$entry.Key] = [string]$entry.Value
+        }
     }
 
     $process = [Diagnostics.Process]::new()
@@ -665,7 +680,7 @@ function Start-CapturedProcess {
     if (-not $process.Start()) {
         throw "Unable to start process: $FilePath"
     }
-    if ($null -ne $StandardInput) {
+    if ($redirectStandardInput) {
         $process.StandardInput.Write($StandardInput)
         $process.StandardInput.Close()
     }
@@ -674,6 +689,31 @@ function Start-CapturedProcess {
         StandardOutput = $process.StandardOutput.ReadToEndAsync()
         StandardError = $process.StandardError.ReadToEndAsync()
     }
+}
+
+function ConvertTo-WindowsCommandLineArgument {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Argument)
+
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $quoted = [Text.StringBuilder]::new('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            $null = $quoted.Append(('\' * (($backslashes * 2) + 1))).Append('"')
+        } else {
+            $null = $quoted.Append(('\' * $backslashes)).Append($character)
+        }
+        $backslashes = 0
+    }
+    $null = $quoted.Append(('\' * ($backslashes * 2))).Append('"')
+    return $quoted.ToString()
 }
 
 function Complete-CapturedProcess {
@@ -753,18 +793,57 @@ function New-LauncherFixture {
         [IO.Directory]::CreateDirectory($directory) | Out-Null
     }
     Copy-Item -LiteralPath $script:LauncherSource -Destination $launcherPath -Force
+    foreach ($dependencyName in @(
+        'apply-browser-trust-overlay.py',
+        'browser-trust-overlay.ps1',
+        'ccswitch_config.py',
+        'ccswitch-credential-vault.ps1',
+        'codex-durable-config.ps1',
+        'get-ccswitch-provider-token.ps1',
+        'powershell-host.ps1',
+        'resolve-ccswitch-root.ps1',
+        'sync-codex-durable-home.ps1',
+        'watch-run-model.ps1'
+    )) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\$dependencyName") -Destination (Join-Path $binRoot $dependencyName) -Force
+    }
     Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\curl.exe') -Destination $fixedBinary -Force
     Write-Utf8NoBom -Path (Join-Path $codexBinRoot 'codex-focusfixed-current.txt') -Content $fixedBinary
+    Write-Utf8NoBom -Path (Join-Path $codexBinRoot 'codex-focusfixed-current.json') `
+        -Content (([ordered]@{ patchedExe = $fixedBinary; enableAfter = 0; disableAfter = 2 } | ConvertTo-Json) + "`n")
 
 $fakeMaterialize = @'
 [CmdletBinding()]
 param(
     [switch]$Quiet,
+    [string]$CcSwitchRoot,
     [ValidateSet('direct', 'prodex')][string]$LaunchMode = 'prodex'
 )
 [IO.File]::WriteAllText($env:FAKE_MATERIALIZE_LOG, $env:PRODEX_HOME)
 $privateProdexHome = Join-Path $env:FAKE_RUN_HOME '.prodex-runtime'
 [IO.Directory]::CreateDirectory($privateProdexHome) | Out-Null
+$runConfig = @"
+model = "model-a"
+model_reasoning_effort = "high"
+model_provider = "provider-a"
+
+[model_providers.provider-a]
+name = "Fixture provider-a"
+base_url = "https://provider-a.invalid/v1"
+wire_api = "responses"
+"@
+[IO.File]::WriteAllText((Join-Path $env:FAKE_RUN_HOME 'config.toml'), $runConfig, [Text.UTF8Encoding]::new($false))
+$runMetadata = [ordered]@{
+    schemaVersion = 2
+    providerId = 'provider-a'
+    model = 'model-a'
+    modelReasoningEffort = 'high'
+}
+[IO.File]::WriteAllText(
+    (Join-Path $env:FAKE_RUN_HOME 'run-provider.json'),
+    (($runMetadata | ConvertTo-Json -Depth 5) + "`n"),
+    [Text.UTF8Encoding]::new($false)
+)
 [pscustomobject]@{
     schemaVersion = 2
     profileName = 'fixture-profile'
@@ -782,6 +861,7 @@ $privateProdexHome = Join-Path $env:FAKE_RUN_HOME '.prodex-runtime'
 param(
     [Parameter(Mandatory = $true)][string]$RunHome,
     [long]$ExitOrder,
+    [string]$CcSwitchRoot,
     [string]$AllowedRunHomesRoot,
     [switch]$Json
 )
@@ -812,6 +892,21 @@ $payload = [ordered]@{
 if ($env:FAKE_PRODEX_STOP -eq '1') {
     throw [Management.Automation.PipelineStoppedException]::new()
 }
+if ($env:FAKE_MODEL_MUTATION -eq '1') {
+    Start-Sleep -Milliseconds 800
+    $configPath = Join-Path $env:FAKE_RUN_HOME 'config.toml'
+    $config = Get-Content -LiteralPath $configPath -Raw
+    $config = [regex]::Replace($config, '(?m)^model\s*=.*$', 'model = "model-selected-live"')
+    [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    while (-not (Test-Path -LiteralPath $env:FAKE_LIVE_PERSIST_MARKER -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-Path -LiteralPath $env:FAKE_LIVE_PERSIST_MARKER -PathType Leaf) {
+        [IO.File]::WriteAllText($env:FAKE_MODEL_OBSERVED_MARKER, 'observed')
+    }
+}
 $exitCode = [int]$env:FAKE_CODEX_EXIT
 & $env:ComSpec /d /c "exit $exitCode"
 '@
@@ -827,7 +922,20 @@ $exitCode = [int]$env:FAKE_CODEX_EXIT
         providerName = 'Historical Provider'
         model = 'historical-model'
         modelReasoningEffort = 'high'
+        configSha256 = 'old'
+        authSha256 = 'old'
     }
+    Write-Utf8NoBom -Path (Join-Path $historicalRunHome 'config.toml') -Content @'
+model = "historical-model"
+model_reasoning_effort = "high"
+model_provider = "provider-history"
+
+[model_providers.provider-history]
+name = "Historical Provider"
+base_url = "https://historical.invalid/v1"
+wire_api = "responses"
+'@
+    Write-Utf8NoBom -Path (Join-Path $historicalRunHome 'auth.json') -Content '{}'
     Write-Utf8NoBom -Path (Join-Path $historicalRunHome 'run-provider.json') `
         -Content (($historicalMetadata | ConvertTo-Json -Depth 5) + "`n")
     Write-Utf8NoBom -Path (Join-Path $historicalProdexHome 'state.json') -Content '{}'
@@ -899,6 +1007,9 @@ function Get-LauncherEnvironment {
         FAKE_PERSIST_ARGS_LOG = $PersistLog + '.args.json'
         FAKE_PERSIST_FAIL = if ($PersistFails) { '1' } else { '0' }
         FAKE_PRODEX_STOP = if ($ProdexStops) { '1' } else { '0' }
+        FAKE_MODEL_MUTATION = '0'
+        FAKE_LIVE_PERSIST_MARKER = ''
+        FAKE_MODEL_OBSERVED_MARKER = ''
         FAKE_CODEX_EXIT = '37'
     }
 }
@@ -1001,8 +1112,14 @@ try {
             -Because 'switching to B must not rewrite A config'
         Assert-Equal -Expected $authABefore -Actual (Get-Content -LiteralPath $authAPath -Raw) `
             -Because 'switching to B must not rewrite A auth'
-        Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $snapshotB.codexHome 'auth.json') -Raw) -like '*TEST_TOKEN_PROVIDER_B*') `
-            -Because 'provider B snapshot must contain only the fixture B auth source'
+        Assert-Equal -Expected '{}' -Actual ((Get-Content -LiteralPath (Join-Path $snapshotB.codexHome 'auth.json') -Raw).Trim()) `
+            -Because 'provider B snapshot must not contain a plaintext credential'
+        $currentConfig = Get-Content -LiteralPath (Join-Path $case.ProdexRoot 'manual-homes\ccswitch-current\config.toml') -Raw
+        Assert-True -Condition ($currentConfig -match '(?m)^model_provider\s*=\s*"provider-b"$') `
+            -Because 'successful materialization must refresh current from the same provider snapshot'
+        $currentAgents = Get-Item -LiteralPath (Join-Path $case.ProdexRoot 'manual-homes\ccswitch-current\agents') -Force
+        Assert-True -Condition (($currentAgents.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) `
+            -Because 'current agents must be a junction to the global durable source'
     }
 
     Invoke-TestCase -Name 'direct_materialization_skips_prodex_profile_registration' -Body {
@@ -1415,6 +1532,56 @@ try {
             -Because 'default direct mode must still persist run model state'
     }
 
+    Invoke-TestCase -Name 'launcher_persists_model_change_before_codex_exits' -Body {
+        $case = New-LauncherFixture
+        $realPersistPath = Join-Path $case.Root 'persist-run-model-real.ps1'
+        Copy-Item -LiteralPath $script:PersistSource -Destination $realPersistPath -Force
+        $persistPath = Join-Path $case.ProdexRoot 'bin\persist-run-model.ps1'
+        $persistWrapper = @'
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$RunHome,
+    [long]$ExitOrder,
+    [string]$CcSwitchRoot,
+    [string]$AllowedRunHomesRoot,
+    [switch]$Json
+)
+try {
+    & $env:REAL_PERSIST_SCRIPT @PSBoundParameters *> $null
+    [IO.File]::AppendAllText($env:FAKE_LIVE_PERSIST_MARKER, 'persisted' + [Environment]::NewLine)
+} catch {
+    throw
+}
+'@
+        Write-Utf8NoBom -Path $persistPath -Content $persistWrapper
+
+        $livePersistMarker = Join-Path $case.Root 'live-model-persisted.marker'
+        $observedMarker = Join-Path $case.Root 'model-change-observed-before-exit.marker'
+        $prodexLog = Join-Path $case.Root 'prodex-live-model.json'
+        $persistLog = Join-Path $case.Root 'persist-live-model.log'
+        $environment = Get-LauncherEnvironment `
+            -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
+        $environment.REAL_PERSIST_SCRIPT = $realPersistPath
+        $environment.FAKE_MODEL_MUTATION = '1'
+        $environment.FAKE_LIVE_PERSIST_MARKER = $livePersistMarker
+        $environment.FAKE_MODEL_OBSERVED_MARKER = $observedMarker
+
+        $process = Start-CapturedProcess `
+            -FilePath $script:Pwsh `
+            -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $case.LauncherPath) `
+            -WorkingDirectory $case.UserRoot `
+            -Environment $environment
+        $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
+        $provider = Get-ProviderState -Case $case -ProviderId 'provider-a'
+
+        Assert-Equal -Expected 37 -Actual $launchResult.ExitCode `
+            -Because 'live model persistence must preserve the Codex exit code'
+        Assert-True -Condition (Test-Path -LiteralPath $observedMarker -PathType Leaf) `
+            -Because 'the changed model must be persisted while Codex is still running'
+        Assert-Equal -Expected 'model-selected-live' -Actual ([string]$provider.model) `
+            -Because 'the next launch must read the model selected in the previous run'
+    }
+
     Invoke-TestCase -Name 'interactive_launcher_shows_update_notice_without_contaminating_exec' -Body {
         $case = New-LauncherFixture
         Set-CaseEnvironment -Case $case
@@ -1684,9 +1851,11 @@ Write-Host '[Codex update] 0.144.6 available; current 0.144.5.'
             -Because 'normal exit cleanup must still persist after the banner'
     }
 
-    Invoke-TestCase -Name 'resume_uuid_reuses_original_run_home_and_private_prodex_state' -Body {
+    Invoke-TestCase -Name 'resume_uuid_reuses_original_home_and_syncs_legacy_durable_state' -Body {
         $case = New-LauncherFixture
         Set-CaseEnvironment -Case $case
+        Remove-Item -LiteralPath (Join-Path $case.HistoricalRunHome 'config.toml') -Force
+        Write-Utf8NoBom -Path (Join-Path $case.UserRoot '.codex\agents\resume.toml') -Content "sandbox_mode = 'read-only'`n"
         $prodexLog = Join-Path $case.Root 'prodex-resume.json'
         $persistLog = Join-Path $case.Root 'persist-resume.log'
         $environment = Get-LauncherEnvironment -Case $case -ProdexLog $prodexLog -PersistLog $persistLog
@@ -1709,6 +1878,8 @@ Write-Host '[Codex update] 0.144.6 available; current 0.144.5.'
             -Because 'resume must launch the profile bound to the original run home'
         Assert-Equal -Expected $case.HistoricalRunHome -Actual ((Get-Content -LiteralPath $persistLog -Raw).Trim()) `
             -Because 'resume cleanup must persist the original run home'
+        Assert-True -Condition (Test-Path -LiteralPath (Join-Path $case.HistoricalRunHome 'agents\resume.toml')) `
+            -Because 'a legacy run without config.toml must still receive current durable files'
     }
 
     Invoke-TestCase -Name 'resume_last_skips_newer_legacy_run_and_selects_latest_recoverable_session' -Body {
@@ -1792,7 +1963,7 @@ Write-Host '[Codex update] 0.144.6 available; current 0.144.5.'
         $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
 
         Assert-Equal -Expected 37 -Actual $launchResult.ExitCode `
-            -Because 'the cross-run session picker must preserve the child exit code'
+            -Because "the cross-run session picker must preserve the child exit code; stderr=$($launchResult.StandardError)"
         $record = Get-Content -LiteralPath $prodexLog -Raw | ConvertFrom-Json
         Assert-Equal -Expected $selectedProdexHome -Actual ([string]$record.prodexHome) `
             -Because 'the selected session must use its original private Prodex state'
@@ -1820,7 +1991,7 @@ Write-Host '[Codex update] 0.144.6 available; current 0.144.5.'
         $launchResult = Complete-CapturedProcess -Handle $process -TimeoutMilliseconds 30000
 
         Assert-Equal -Expected 130 -Actual $launchResult.ExitCode `
-            -Because 'canceling the cross-run session picker must use the conventional interrupted exit code'
+            -Because "canceling the picker must return the interrupted exit code; stderr=$($launchResult.StandardError)"
         Assert-True -Condition (-not (Test-Path -LiteralPath $prodexLog)) `
             -Because 'canceling the picker must not launch Prodex'
         Assert-True -Condition (-not (Test-Path -LiteralPath $persistLog)) `
